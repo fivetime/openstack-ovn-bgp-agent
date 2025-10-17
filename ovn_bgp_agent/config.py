@@ -83,31 +83,81 @@ agent_opts = [
                default=None,
                help='Router ID to be used by the Agent when running in BGP '
                     'mode and configuring the VRF route leaking.'),
+
+    # =========================================================================
+    # EVPN Configuration Options
+    # =========================================================================
     cfg.IPOpt('evpn_local_ip',
               default=None,
               help='IP address of local EVPN VXLAN (tunnel) endpoint. '
-                   'This option can be used instead of the evpn_nic one. '
-                   'If none specified, it will take the one from the '
-                   'loopback device.'),
+                   'This is the VTEP (VXLAN Tunnel Endpoint) IP address. '
+                   'If not specified, will try to use IP from evpn_nic. '
+                   'If evpn_nic is also not set, will use loopback IP.'),
     cfg.StrOpt('evpn_nic',
                default=None,
-               help='NIC with the IP address to use for the local EVPN '
-                    'VXLAN (tunnel) endpoint. This option can be used '
-                    'instead of the evpn_local_ip one. If none specified, '
-                    'it will take the one from the loopback device.'),
+               help='Network interface to get VTEP IP address from. '
+                    'Only used if evpn_local_ip is not explicitly set. '
+                    'If neither evpn_local_ip nor evpn_nic is set, '
+                    'the loopback device IP will be used.'),
     cfg.PortOpt('evpn_udp_dstport',
                 default=4789,
-                help='The UDP port used for EVPN VXLAN communication. By '
-                     'default 4789 is being used.'),
+                help='UDP destination port for VXLAN encapsulation. '
+                     'Default is 4789 (IANA assigned port for VXLAN).'),
+    cfg.StrOpt('evpn_bridge',
+               default='br-evpn',
+               help='Linux bridge name for attaching EVPN VNI devices. '
+                    'All L2VNI and L3VNI VXLAN devices will be connected '
+                    'to this bridge. This bridge is separate from OVS.'),
+    cfg.StrOpt('evpn_bridge_veth',
+               default='veth-to-ovs',
+               help='Veth interface name on EVPN bridge side. '
+                    'This forms one end of the veth pair connecting '
+                    'the EVPN bridge to OVS integration bridge.'),
+    cfg.StrOpt('evpn_ovs_veth',
+               default='veth-to-evpn',
+               help='Veth interface name on OVS bridge side. '
+                    'This forms the other end of the veth pair connecting '
+                    'the OVS integration bridge to EVPN bridge.'),
+    cfg.IntOpt('l2vni_offset',
+               default=None,
+               help='Offset for automatic L2VNI calculation from VLAN ID. '
+                    'Formula: L2VNI = VLAN_ID + l2vni_offset. '
+                    'Example: If VLAN is 100 and offset is 10000, L2VNI=10100. '
+                    'Can be overridden by explicit VNI in OVN external_ids. '
+                    'Set to None to disable automatic calculation.'),
+    cfg.BoolOpt('evpn_static_fdb',
+                default=True,
+                help='Pre-populate bridge FDB (Forwarding Database) with MAC '
+                     'addresses from OVN Port_Binding. This optimization '
+                     'reduces L2 flooding and helps trigger EVPN Type-2 '
+                     'MACIP route advertisement immediately.'),
+    cfg.BoolOpt('evpn_static_neighbors',
+                default=True,
+                help='Pre-populate kernel neighbor table (ARP/NDP cache) with '
+                     'IP-to-MAC mappings from OVN Port_Binding. This reduces '
+                     'ARP/NDP queries and triggers EVPN Type-2 route '
+                     'advertisement for known hosts.'),
+    cfg.StrOpt('ovs_bridge',
+               default='br-ex',
+               help='OVS bridge name to connect EVPN infrastructure to. '
+                    'Typically br-ex for provider network bridge or br-int '
+                    'for integration bridge.'),
+
+    # =========================================================================
+    # BGP/VRF Configuration Options
+    # =========================================================================
     cfg.BoolOpt('clear_vrf_routes_on_startup',
-                help='If enabled, all routes are removed from the VRF table'
-                     '(specified by bgp_vrf_table_id option) at startup.',
+                help='If enabled, all routes are removed from the VRF table '
+                     '(specified by bgp_vrf_table_id option) at agent startup. '
+                     'Useful for cleaning up stale routes after restart.',
                 default=False),
     cfg.BoolOpt('delete_vrf_on_disconnect',
-                help='If enabled agent will take care of completely deleting'
-                     'VRF from both kernel and FRR configuration.'
-                     'Disabling option will keep VRF even when agent considers'
-                     'its presence as redundant',
+                help='If enabled, agent will completely delete VRF device '
+                     'from both kernel and FRR configuration when it is '
+                     'no longer needed. If disabled, VRF device will be kept '
+                     'even when redundant (only FRR config is removed). '
+                     'Note: For EVPN driver, this typically should be False '
+                     'to allow VRF reuse.',
                 default=True),
     cfg.StrOpt('bgp_nic',
                default='bgp-nic',
@@ -124,25 +174,20 @@ agent_opts = [
                     'created.'),
     cfg.ListOpt('address_scopes',
                 default=None,
-                help='Allows to filter on the address scope. Only networks'
-                     ' with the same address scope on the provider and'
-                     ' internal interface are announced.'),
+                help='Allows to filter on the address scope. Only networks '
+                     'with the same address scope on the provider and '
+                     'internal interface are announced.'),
     cfg.StrOpt('exposing_method',
                default='underlay',
                choices=('underlay', 'l2vni', 'vrf', 'dynamic', 'ovn'),
-               help='The exposing mechanism to be used. underlay is the '
-                    'default and simply expose it on the default/plain '
-                    'network.'
-                    'With l2vni the l2 is extended over the l3 infrastructure '
-                    'and it is exposed on a given VNI (Type-2).'
-                    'With vrf the routes are exposed in different VRFs/VNIs '
-                    '(Type-5).'
-                    'With dynamic, a mix between underlay, l2vni and vrf is '
-                    'used, depending on the information annotated on the '
-                    'ports. '
-                    'Finally, with ovn, instead of using kernel networking a '
-                    'dedicated ovn cluster per node is used for the traffic '
-                    'redirection'),
+               help='The exposing mechanism to be used. '
+                    '"underlay" (default): Expose on default/plain network. '
+                    '"l2vni": Extend L2 over L3 infrastructure via VNI (Type-2). '
+                    '"vrf": Expose routes in different VRFs/VNIs (Type-5). '
+                    '"dynamic": Mix of underlay, l2vni, and vrf based on '
+                    'port annotations. '
+                    '"ovn": Use dedicated per-node OVN cluster for traffic '
+                    'redirection instead of kernel networking.'),
 ]
 
 root_helper_opts = [
@@ -167,8 +212,8 @@ ovn_opts = [
     cfg.StrOpt('ovn_sb_ca_cert',
                default='/etc/ipa/ca.crt',
                deprecated_group='DEFAULT',
-               help='The PEM file with CA certificate that OVN should use to'
-                    ' verify certificates presented to it by SSL peers'),
+               help='The PEM file with CA certificate that OVN should use to '
+                    'verify certificates presented to it by SSL peers'),
     cfg.StrOpt('ovn_sb_connection',
                deprecated_group='DEFAULT',
                regex=r'^(tcp|ssl|unix):.+',
@@ -188,8 +233,8 @@ ovn_opts = [
     cfg.StrOpt('ovn_nb_ca_cert',
                default='/etc/ipa/ca.crt',
                deprecated_group='DEFAULT',
-               help='The PEM file with CA certificate that OVN should use to'
-                    ' verify certificates presented to it by SSL peers'),
+               help='The PEM file with CA certificate that OVN should use to '
+                    'verify certificates presented to it by SSL peers'),
     cfg.StrOpt('ovn_nb_connection',
                deprecated_group='DEFAULT',
                regex=r'^(tcp|ssl|unix):.+',
@@ -218,11 +263,11 @@ local_ovn_cluster_opts = [
                 help='List of prefixes for provider networks'),
     cfg.StrOpt('bgp_chassis_id',
                default='bgp',
-               help='The chassis_id used for the ovn-controller instance'
-                    ' related to the node-local OVN instance. Used as a'
-                    ' suffix for getting instance-specific options'
-                    ' from OVSDB. This option has effect only when the OVN'
-                    ' NB driver is used.'),
+               help='The chassis_id used for the ovn-controller instance '
+                    'related to the node-local OVN instance. Used as a '
+                    'suffix for getting instance-specific options '
+                    'from OVSDB. This option has effect only when the OVN '
+                    'NB driver is used.'),
 ]
 
 CONF = cfg.CONF
@@ -246,7 +291,7 @@ def init(args, **kwargs):
 
 def setup_logging():
     logging.set_defaults(default_log_levels=logging.get_default_log_levels() +
-                         EXTRA_LOG_LEVEL_DEFAULTS)
+                                            EXTRA_LOG_LEVEL_DEFAULTS)
     logging.setup(CONF, 'bgp-agent')
     LOG.info("Logging enabled!")
 

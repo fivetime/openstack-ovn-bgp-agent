@@ -149,3 +149,77 @@ def get_port_vrf_settings(port):
                 port.external_ids[constants.OVN_EVPN_VNI_EXT_ID_KEY])
         except (AttributeError, KeyError):
             return ''
+
+def get_interface(device):
+    """Check if network interface exists.
+
+    :param device: Device name
+    :return: True if exists, False otherwise
+    """
+    return linux_net.get_link_id(device) is not None
+
+def add_veth(veth_a, veth_b):
+    """Create veth pair.
+
+    :param veth_a: First veth interface name
+    :param veth_b: Second veth interface name
+    """
+    linux_net.ensure_veth(veth_a, veth_b)
+
+def set_device_mtu(device, mtu):
+    """Set device MTU.
+
+    :param device: Device name
+    :param mtu: MTU value
+    """
+    try:
+        linux_net.set_link_attribute(device, mtu=mtu)
+        LOG.debug("Set MTU %d on device %s", mtu, device)
+    except Exception as e:
+        LOG.warning("Failed to set MTU on %s: %s", device, e)
+
+
+def get_device_mtu(device):
+    """Get device MTU.
+
+    :param device: Device name
+    :return: MTU value or None
+    """
+    try:
+        link_device = linux_net.get_link_device(device)
+        if link_device:
+            return linux_net.get_attr(link_device, 'IFLA_MTU')
+    except Exception as e:
+        LOG.debug("Failed to get MTU for %s: %s", device, e)
+    return None
+
+
+def add_ips_to_dev(device, ips):
+    """Add IP addresses to device.
+
+    :param device: Device name
+    :param ips: List of IP addresses in CIDR format
+    """
+    for ip in ips:
+        try:
+            linux_net.add_ip_address(ip, device)
+            LOG.debug("Added IP %s to device %s", ip, device)
+        except Exception as e:
+            if "File exists" not in str(e):
+                LOG.warning("Failed to add IP %s to %s: %s", ip, device, e)
+
+
+def del_ips_from_dev(device, ips):
+    """Delete IP addresses from device.
+
+    :param device: Device name
+    :param ips: List of IP addresses in CIDR format
+    """
+    for ip in ips:
+        try:
+            linux_net.delete_ip_address(ip, device)
+            LOG.debug("Deleted IP %s from device %s", ip, device)
+        except Exception as e:
+            if "Cannot assign" not in str(e):
+                LOG.warning("Failed to delete IP %s from %s: %s",
+                            ip, device, e)

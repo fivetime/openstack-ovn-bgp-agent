@@ -630,3 +630,235 @@ def list_ip_rules(ip_version, **kwargs):
     with iproute.IPRoute() as ip:
         return make_serializable(ip.get_rules(
             family=common_utils.IP_VERSION_FAMILY_MAP[ip_version], **kwargs))
+
+# ============================================================================
+# 在现有的 privileged/linux_net.py 文件末尾添加以下 EVPN 相关方法
+# ============================================================================
+
+@ovn_bgp_agent.privileged.default.entrypoint
+def set_bridge_port_learning(device, learning):
+    """Set bridge port learning state.
+
+    :param device: Bridge port device name
+    :param learning: True to enable, False to disable
+    """
+    try:
+        _run_iproute_brport('set', device, learning=learning)
+    except Exception as e:
+        LOG.warning("Failed to set learning on %s: %s", device, e)
+
+
+@ovn_bgp_agent.privileged.default.entrypoint
+def set_bridge_port_neigh_suppress(device, suppress):
+    """Set bridge port neighbor suppression.
+
+    :param device: Bridge port device name
+    :param suppress: True to enable, False to disable
+    """
+    try:
+        _run_iproute_brport('set', device, neigh_suppress=suppress)
+    except Exception as e:
+        LOG.warning("Failed to set neigh_suppress on %s: %s", device, e)
+
+
+@ovn_bgp_agent.privileged.default.entrypoint
+def add_bridge_fdb(mac, device, vlan=None, master=True, static=True):
+    """Add static FDB entry to bridge.
+
+    Uses 'bridge' command as pyroute2 FDB support is limited.
+
+    :param mac: MAC address
+    :param device: Bridge port device
+    :param vlan: VLAN ID (optional)
+    :param master: Add to bridge FDB (vs device FDB)
+    :param static: Make entry static
+    """
+    cmd = ['bridge', 'fdb', 'add', mac, 'dev', device]
+
+    if master:
+        cmd.append('master')
+    if vlan is not None:
+        cmd.extend(['vlan', str(vlan)])
+    if static:
+        cmd.append('static')
+
+    try:
+        processutils.execute(*cmd, run_as_root=True)
+    except processutils.ProcessExecutionError as e:
+        # Ignore if entry already exists
+        if "File exists" in str(e):
+            LOG.debug("FDB entry %s already exists on %s VLAN %s",
+                      mac, device, vlan)
+        else:
+            LOG.error("Failed to add FDB entry %s on %s: %s", mac, device, e)
+            raise
+
+
+@ovn_bgp_agent.privileged.default.entrypoint
+def del_bridge_fdb(mac, device, vlan=None, master=True):
+    """Delete FDB entry from bridge.
+
+    :param mac: MAC address
+    :param device: Bridge port device
+    :param vlan: VLAN ID (optional)
+    :param master: Remove from bridge FDB
+    """
+    cmd = ['bridge', 'fdb', 'del', mac, 'dev', device]
+
+    if master:
+        cmd.append('master')
+    if vlan is not None:
+        cmd.extend(['vlan', str(vlan)])
+
+    try:
+        processutils.execute(*cmd, run_as_root=True)
+    except processutils.ProcessExecutionError as e:
+        if "No such file or directory" not in str(e):
+            LOG.warning("Failed to delete FDB entry %s on %s: %s",
+                        mac, device, e)
+
+
+@ovn_bgp_agent.privileged.default.entrypoint
+def get_bridge_fdb(device):
+    """Get FDB entries for a bridge port.
+
+    :param device: Bridge port device name
+    :return: List of FDB entries (parsed from JSON)
+    """
+    try:
+        out, _err = processutils.execute('bridge', '-j', 'fdb', 'show',
+                                         'dev', device, run_as_root=True)
+        import json
+        return json.loads(out)
+    except Exception as e:
+        LOG.warning("Failed to get FDB entries for %s: %s", device, e)
+        return []
+
+
+@ovn_bgp_agent.privileged.default.entrypoint
+def ensure_bridge_vlan(bridge, vlan, tagged=True, pvid=False, untagged=False):
+    """Ensure VLAN is present on bridge or bridge port.
+
+    :param bridge: Bridge or bridge port device name
+    :param vlan: VLAN ID
+    :param tagged: VLAN is tagged (default True)
+    :param pvid: Set as PVID (default False)
+    :param untagged: Set as untagged (default False)
+    """
+    cmd = ['bridge', 'vlan', 'add', 'dev', bridge, 'vid', str(vlan)]
+
+    if pvid:
+        cmd.append('pvid')
+    if untagged:
+        cmd.append('untagged')
+    # Note: 'self' flag is automatically applied for bridge device itself
+
+    try:
+        processutils.execute(*cmd, run_as_root=True)
+    except processutils.ProcessExecutionError as e:
+        if "File exists" in str(e):
+            LOG.debug("VLAN %s already exists on %s", vlan, bridge)
+        else:
+            LOG.error("Failed to add VLAN %s to %s: %s", vlan, bridge, e)
+            raise
+
+
+@ovn_bgp_agent.privileged.default.entrypoint
+def del_bridge_vlan(bridge, vlan):
+    """Remove VLAN from bridge or bridge port.
+
+    :param bridge: Bridge or bridge port device name
+    :param vlan: VLAN ID
+    """
+    cmd = ['bridge', 'vlan', 'del', 'dev', bridge, 'vid', str(vlan)]
+
+    try:
+        processutils.execute(*cmd, run_as_root=True)
+    except processutils.ProcessExecutionError as e:
+        if "No such file or directory" not in str(e):
+            LOG.warning("Failed to delete VLAN %s from %s: %s",
+                        vlan, bridge, e)
+
+@ovn_bgp_agent.privileged.default.entrypoint
+def enable_proxy_arp(device):
+    """Enable proxy ARP on device.
+
+    :param device: Device name
+    """
+    flag = f'net.ipv4.conf.{device}.proxy_arp'
+    try:
+        set_kernel_flag(flag, 1)
+    except Exception as e:
+        LOG.warning("Failed to enable proxy ARP on %s: %s", device, e)
+
+
+@ovn_bgp_agent.privileged.default.entrypoint
+def enable_proxy_ndp(device):
+    """Enable proxy NDP (IPv6 ND proxy) on device.
+
+    :param device: Device name
+    """
+    flag = f'net.ipv6.conf.{device}.proxy_ndp'
+    try:
+        set_kernel_flag(flag, 1)
+    except Exception as e:
+        LOG.warning("Failed to enable proxy NDP on %s: %s", device, e)
+
+
+@ovn_bgp_agent.privileged.default.entrypoint
+def get_interface_address(device):
+    """Get MAC address of an interface.
+
+    :param device: Device name
+    :return: MAC address as string
+    """
+    try:
+        link_device = get_link_device(device)
+        if link_device:
+            return get_attr(link_device, 'IFLA_ADDRESS')
+    except Exception as e:
+        LOG.warning("Failed to get MAC address for %s: %s", device, e)
+    return None
+
+
+@ovn_bgp_agent.privileged.default.entrypoint
+def get_interface_index(device):
+    """Get interface index.
+
+    :param device: Device name
+    :return: Interface index as integer
+    """
+    try:
+        return _get_link_id(device, raise_exception=False)
+    except Exception as e:
+        LOG.warning("Failed to get interface index for %s: %s", device, e)
+    return None
+
+
+@ovn_bgp_agent.privileged.default.entrypoint
+def get_interfaces():
+    """Get list of all network interfaces.
+
+    :return: List of interface names
+    """
+    try:
+        devices = get_link_devices()
+        return [get_attr(dev, 'IFLA_IFNAME') for dev in devices]
+    except Exception as e:
+        LOG.error("Failed to get interfaces: %s", e)
+        return []
+
+
+@ovn_bgp_agent.privileged.default.entrypoint
+def disable_learning_vxlan_intf(device):
+    """Disable learning on VXLAN interface.
+
+    This is a convenience wrapper for VXLAN-specific learning disable.
+
+    :param device: VXLAN device name
+    """
+    try:
+        # For VXLAN, we set learning off via device attribute
+        set_link_attribute(device, learning=False)
+    except Exception as e:
+        LOG.warning("Failed to disable learning on VXLAN %s: %s", device, e)

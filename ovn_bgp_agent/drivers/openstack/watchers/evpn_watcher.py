@@ -88,24 +88,26 @@ class SubnetRouterAttachedEvent(base_watcher.PortBindingChassisEvent):
         try:
             if event == self.ROW_UPDATE:
                 return (not row.chassis and
-                        not row.logical_port.startswith('lrp-') and
-                        row.external_ids[constants.OVN_EVPN_VNI_EXT_ID_KEY] and
-                        row.external_ids[constants.OVN_EVPN_AS_EXT_ID_KEY] and
+                        row.type == constants.OVN_PATCH_VIF_PORT_TYPE and
+                        row.external_ids.get(
+                            constants.OVN_EVPN_VNI_EXT_ID_KEY) and
+                        row.external_ids.get(
+                            constants.OVN_EVPN_AS_EXT_ID_KEY) and
                         (not old.external_ids.get(
                             constants.OVN_EVPN_VNI_EXT_ID_KEY) or
                          not old.external_ids.get(
-                             constants.constants.OVN_EVPN_AS_EXT_ID_KEY)))
+                             constants.OVN_EVPN_AS_EXT_ID_KEY)))  # ✅ 修复 bug
             else:
                 return (not row.chassis and
-                        not row.logical_port.startswith('lrp-') and
-                        row.external_ids[constants.OVN_EVPN_VNI_EXT_ID_KEY] and
-                        row.external_ids[constants.OVN_EVPN_AS_EXT_ID_KEY])
+                        row.type == constants.OVN_PATCH_VIF_PORT_TYPE and
+                        row.external_ids.get(
+                            constants.OVN_EVPN_VNI_EXT_ID_KEY) and
+                        row.external_ids.get(
+                            constants.OVN_EVPN_AS_EXT_ID_KEY))
         except (IndexError, AttributeError, KeyError):
             return False
 
     def _run(self, event, row, old):
-        if row.type != constants.OVN_PATCH_VIF_PORT_TYPE:
-            return
         with _SYNC_STATE_LOCK.read_lock():
             if row.nat_addresses:
                 self.agent.expose_ip(row)
@@ -123,24 +125,26 @@ class SubnetRouterDetachedEvent(base_watcher.PortBindingChassisEvent):
         try:
             if event == self.ROW_UPDATE:
                 return (not row.chassis and
-                        not row.logical_port.startswith('lrp-') and
-                        old.external_ids[constants.OVN_EVPN_VNI_EXT_ID_KEY] and
-                        old.external_ids[constants.OVN_EVPN_AS_EXT_ID_KEY] and
+                        row.type == constants.OVN_PATCH_VIF_PORT_TYPE and
+                        old.external_ids.get(
+                            constants.OVN_EVPN_VNI_EXT_ID_KEY) and
+                        old.external_ids.get(
+                            constants.OVN_EVPN_AS_EXT_ID_KEY) and
                         (not row.external_ids.get(
                             constants.OVN_EVPN_VNI_EXT_ID_KEY) or
                          not row.external_ids.get(
-                             constants.OVN_EVPN_AS_EXT_ID_KEY)))
+                             constants.OVN_EVPN_AS_EXT_ID_KEY)))  # ✅ 修复 bug
             else:
                 return (not row.chassis and
-                        not row.logical_port.startswith('lrp-') and
-                        row.external_ids[constants.OVN_EVPN_VNI_EXT_ID_KEY] and
-                        row.external_ids[constants.OVN_EVPN_AS_EXT_ID_KEY])
+                        row.type == constants.OVN_PATCH_VIF_PORT_TYPE and
+                        row.external_ids.get(
+                            constants.OVN_EVPN_VNI_EXT_ID_KEY) and
+                        row.external_ids.get(
+                            constants.OVN_EVPN_AS_EXT_ID_KEY))
         except (IndexError, AttributeError, KeyError):
             return False
 
     def _run(self, event, row, old):
-        if row.type != constants.OVN_PATCH_VIF_PORT_TYPE:
-            return
         with _SYNC_STATE_LOCK.read_lock():
             if row.nat_addresses:
                 self.agent.withdraw_ip(row)
@@ -213,3 +217,82 @@ class LocalnetCreateDeleteEvent(base_watcher.PortBindingChassisEvent):
     def _run(self, event, row, old):
         with _SYNC_STATE_LOCK.read_lock():
             self.agent.sync()
+
+class PortAssociationCreatedEvent(base_watcher.PortBindingChassisEvent):
+    """Handle port-specific EVPN configuration (bgpvpn-routes-control).
+
+    When a port association is created, networking-bgpvpn writes EVPN
+    external_ids to the Port_Binding for that specific port.
+    """
+    def __init__(self, bgp_agent):
+        events = (self.ROW_UPDATE, self.ROW_CREATE,)
+        super(PortAssociationCreatedEvent, self).__init__(bgp_agent, events)
+
+    def match_fn(self, event, row, old):
+        try:
+            # Match VM/virtual ports (not patch ports)
+            if row.type not in (constants.OVN_VM_VIF_PORT_TYPE,
+                                constants.OVN_VIRTUAL_VIF_PORT_TYPE):
+                return False
+
+            # Check if port has EVPN external_ids
+            has_evpn_config = (
+                    row.external_ids.get(constants.OVN_EVPN_VNI_EXT_ID_KEY) and
+                    row.external_ids.get(constants.OVN_EVPN_AS_EXT_ID_KEY)
+            )
+
+            if event == self.ROW_UPDATE:
+                # Check if EVPN config was just added
+                old_has_evpn = (
+                        old.external_ids.get(constants.OVN_EVPN_VNI_EXT_ID_KEY) and
+                        old.external_ids.get(constants.OVN_EVPN_AS_EXT_ID_KEY)
+                )
+                return has_evpn_config and not old_has_evpn
+            else:
+                # ROW_CREATE
+                return has_evpn_config
+
+        except (IndexError, AttributeError, KeyError):
+            return False
+
+    def _run(self, event, row, old):
+        with _SYNC_STATE_LOCK.read_lock():
+            self.agent.expose_port_association(row)
+
+
+class PortAssociationDeletedEvent(base_watcher.PortBindingChassisEvent):
+    """Handle port association removal."""
+    def __init__(self, bgp_agent):
+        events = (self.ROW_UPDATE, self.ROW_DELETE,)
+        super(PortAssociationDeletedEvent, self).__init__(bgp_agent, events)
+
+    def match_fn(self, event, row, old):
+        try:
+            if row.type not in (constants.OVN_VM_VIF_PORT_TYPE,
+                                constants.OVN_VIRTUAL_VIF_PORT_TYPE):
+                return False
+
+            if event == self.ROW_UPDATE:
+                # Check if EVPN config was removed
+                old_has_evpn = (
+                        old.external_ids.get(constants.OVN_EVPN_VNI_EXT_ID_KEY) and
+                        old.external_ids.get(constants.OVN_EVPN_AS_EXT_ID_KEY)
+                )
+                has_evpn = (
+                        row.external_ids.get(constants.OVN_EVPN_VNI_EXT_ID_KEY) and
+                        row.external_ids.get(constants.OVN_EVPN_AS_EXT_ID_KEY)
+                )
+                return old_has_evpn and not has_evpn
+            else:
+                # ROW_DELETE
+                return (
+                        row.external_ids.get(constants.OVN_EVPN_VNI_EXT_ID_KEY) and
+                        row.external_ids.get(constants.OVN_EVPN_AS_EXT_ID_KEY)
+                )
+
+        except (IndexError, AttributeError, KeyError):
+            return False
+
+    def _run(self, event, row, old):
+        with _SYNC_STATE_LOCK.read_lock():
+            self.agent.withdraw_port_association(row)

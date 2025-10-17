@@ -221,3 +221,190 @@ def vrf_reconfigure(evpn_info, action):
     vrf_config = vrf_template.render(**opts)
 
     _run_vtysh_config_with_tempfile(vrf_config)
+
+
+def ensure_evpn_vrf(vrf_name, l3vni=None, leak_to_underlay=False):
+    """Ensure EVPN VRF configuration in FRR.
+
+    :param vrf_name: VRF name
+    :param l3vni: L3VNI for symmetric IRB (None for L2 only)
+    :param leak_to_underlay: Leak routes to/from default VRF
+    """
+    asn = get_asn()
+    if not asn:
+        LOG.warning("Cannot configure EVPN VRF without BGP AS number")
+        return
+
+    config_lines = [
+        f'router bgp {asn} vrf {vrf_name}',
+        f' no bgp default ipv4-unicast',
+        f' bgp disable-ebgp-connected-route-check',
+        f' bgp bestpath as-path multipath-relax',
+        f' address-family ipv4 unicast',
+        f'  redistribute kernel',
+        f'  redistribute connected',
+        f' exit-address-family',
+        f' address-family ipv6 unicast',
+        f'  redistribute kernel',
+        f'  redistribute connected',
+        f' exit-address-family',
+    ]
+
+    # Configure L3VNI mapping
+    if l3vni:
+        config_lines.extend([
+            f' address-family l2vpn evpn',
+            f'  advertise ipv4 unicast',
+            f'  advertise ipv6 unicast',
+            f' exit-address-family',
+            f'exit',
+            f'vrf {vrf_name}',
+            f' vni {l3vni}',
+            f'exit-vrf',
+        ])
+    else:
+        config_lines.append('exit')
+
+    # Configure route leaking if requested
+    if leak_to_underlay:
+        vrf_leak(from_vrf=vrf_name, to_vrf='default')
+        vrf_leak(from_vrf='default', to_vrf=vrf_name)
+
+    run_vtysh_config('\n'.join(config_lines))
+    LOG.info("Configured EVPN VRF %s (L3VNI: %s, leak: %s)",
+             vrf_name, l3vni, leak_to_underlay)
+
+
+def delete_evpn_vrf(vrf_name, l3vni=None):
+    """Remove EVPN VRF configuration from FRR.
+
+    :param vrf_name: VRF name
+    :param l3vni: L3VNI (if configured)
+    """
+    asn = get_asn()
+    if not asn:
+        return
+
+    config_lines = [
+        f'no router bgp {asn} vrf {vrf_name}',
+    ]
+
+    if l3vni:
+        config_lines.extend([
+            f'no vrf {vrf_name}',
+        ])
+
+    run_vtysh_config('\n'.join(config_lines))
+    LOG.info("Deleted EVPN VRF configuration for %s", vrf_name)
+
+
+def ensure_evpn_base_config():
+    """Ensure base EVPN configuration exists in FRR.
+
+    Configures:
+    - advertise-all-vni (for Type-2/3 routes)
+    - EVPN address family on BGP
+    """
+    asn = get_asn()
+    if not asn:
+        LOG.warning("Cannot configure base EVPN without BGP AS number")
+        return
+
+    config_lines = [
+        f'router bgp {asn}',
+        f' address-family l2vpn evpn',
+        f'  advertise-all-vni',
+        f' exit-address-family',
+        f'exit',
+    ]
+
+    run_vtysh_config('\n'.join(config_lines))
+    LOG.info("Configured base EVPN settings")
+
+
+def ensure_redistribute_connected_route_map(vrf_name, irb_device):
+    """Ensure route-map for selective connected route redistribution.
+
+    :param vrf_name: VRF name
+    :param irb_device: IRB device to permit
+    """
+    asn = get_asn()
+    if not asn:
+        return
+
+    route_map_name = f'{vrf_name}-redist-connected'
+
+    # Extract VLAN ID from IRB device name (irb-100 -> 100)
+    vlan_id = irb_device.split('-')[-1] if '-' in irb_device else '10000'
+
+    config_lines = [
+        f'route-map {route_map_name} permit {vlan_id}',
+        f' match interface {irb_device}',
+        f'exit',
+        f'route-map {route_map_name} deny 65535',
+        f'exit',
+        f'router bgp {asn} vrf {vrf_name}',
+        f' address-family ipv4 unicast',
+        f'  redistribute connected route-map {route_map_name}',
+        f' exit-address-family',
+        f' address-family ipv6 unicast',
+        f'  redistribute connected route-map {route_map_name}',
+        f' exit-address-family',
+        f'exit',
+    ]
+
+    run_vtysh_config('\n'.join(config_lines))
+    LOG.info("Configured redistribute connected route-map for %s", vrf_name)
+
+
+def get_asn():
+    """Get BGP AS number from configuration.
+
+    :return: AS number as string or None
+    """
+    # Check if bgp_AS is configured
+    if hasattr(CONF, 'bgp_AS') and CONF.bgp_AS:
+        return CONF.bgp_AS
+
+    # Try to read from running config
+    try:
+        output = run_vtysh_command('show running-config')
+        for line in output.splitlines():
+            if line.startswith('router bgp '):
+                asn = line.split()[2]
+                return asn
+    except Exception as e:
+        LOG.debug("Failed to get ASN from FRR: %s", e)
+
+    return None
+
+
+def run_vtysh_config(config):
+    """Run vtysh configuration commands.
+
+    :param config: Configuration string (multiple lines)
+    """
+    import ovn_bgp_agent.privileged.vtysh as vtysh_priv
+
+    # Write config to temporary file
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.conf',
+                                     delete=False) as f:
+        f.write(config)
+        config_file = f.name
+
+    try:
+        vtysh_priv.run_vtysh_config(config_file)
+    finally:
+        import os
+        os.unlink(config_file)
+
+
+def run_vtysh_command(command):
+    """Run single vtysh command.
+
+    :param command: Command to run
+    :return: Command output
+    """
+    import ovn_bgp_agent.privileged.vtysh as vtysh_priv
+    return vtysh_priv.run_vtysh_command(command)

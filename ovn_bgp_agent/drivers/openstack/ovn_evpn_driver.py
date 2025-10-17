@@ -1,4 +1,5 @@
-# Copyright 2021 Red Hat, Inc.
+# Copyright 2025 Red Hat, Inc.
+# Copyright 2024 Tore Anderson (evpn_agent design concepts)
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,8 +13,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""OVN EVPN Driver - Complete L2VNI/L3VNI/IRB Implementation
+
+This driver works with networking-bgpvpn to provide full EVPN support:
+- Reads EVPN configuration from OVN external_ids (written by networking-bgpvpn)
+- Configures data plane: VXLAN devices, VRFs, IRB devices
+- Integrates with FRR for BGP EVPN signaling
+- Manages static FDB and neighbor entries for optimization
+
+Architecture:
+  [networking-bgpvpn] → [OVN NB external_ids] → [ovn-bgp-agent/this driver]
+      → [VXLAN/VRF/IRB] + [FRR EVPN]
+"""
+
 import collections
 import ipaddress
+import json
 import threading
 
 from oslo_concurrency import lockutils
@@ -22,42 +37,68 @@ from oslo_log import log as logging
 
 from ovn_bgp_agent import constants
 from ovn_bgp_agent.drivers import driver_api
+from ovn_bgp_agent.drivers.openstack.utils import driver_utils
 from ovn_bgp_agent.drivers.openstack.utils import frr
 from ovn_bgp_agent.drivers.openstack.utils import ovn
 from ovn_bgp_agent.drivers.openstack.utils import ovs
-from ovn_bgp_agent.drivers.openstack.watchers import base_watcher
-from ovn_bgp_agent.drivers.openstack.watchers import evpn_watcher as \
-    watcher
-from ovn_bgp_agent.utils import helpers
+from ovn_bgp_agent.drivers.openstack.watchers import evpn_watcher
+from ovn_bgp_agent import exceptions as agent_exc
 from ovn_bgp_agent.utils import linux_net
 
 
 CONF = cfg.CONF
 LOG = logging.getLogger(__name__)
-# LOG.setLevel(logging.DEBUG)
-# logging.basicConfig(level=logging.DEBUG)
 
-OVN_TABLES = ["Port_Binding", "Chassis", "Datapath_Binding", "Chassis_Private"]
-EVPN_INFO = collections.namedtuple(
-    'EVPNInfo', ['vrf_name', 'lo_name', 'bridge_name', 'vxlan_name',
-                 'veth_vrf', 'veth_ovs', 'vlan_name'])
+# OVN tables to monitor
+OVN_TABLES = [
+    "Port_Binding",
+    "Chassis",
+    "Datapath_Binding",
+    "Load_Balancer",
+    "Chassis_Private",
+]
 
 
 class OVNEVPNDriver(driver_api.AgentDriverBase):
+    """OVN EVPN Driver with full L2VNI/L3VNI/symmetric IRB support.
+
+    Key Features:
+    - L2VNI: VXLAN-based Layer 2 extension
+    - L3VNI: Symmetric IRB with VRF per tenant
+    - Static FDB/Neighbor entries for EVPN Type-2 routes
+    - FRR integration for BGP EVPN (Type-2 MACIP, Type-5 Prefix)
+
+    EVPN Configuration Source:
+    - networking-bgpvpn writes to OVN NB Logical_Switch.external_ids
+    - OVN syncs to SB Port_Binding.external_ids (patch ports)
+    - This driver reads from Port_Binding and configures data plane
+    """
 
     def __init__(self):
-        self.ovn_bridge_mappings = {}  # {'public': 'br-ex'}
-        self.ovn_local_cr_lrps = {}
-        self.ovn_local_lrps = {}
-        # {'br-ex': [route1, route2]}
-        self._ovn_routing_tables_routes = collections.defaultdict()
-        self._ovn_exposed_evpn_ips = collections.defaultdict()
+        super().__init__()
 
+        # Tracked EVPN networks: {network_id: network_info}
+        self.evpn_networks = {}
+
+        # Tracked VRFs: {vrf_name: vrf_info}
+        self.evpn_vrfs = {}
+
+        # Tracked ports: {port_id: port_info}
+        self.evpn_ports = {}
+
+        # FDB entries: {bridge: [(mac, vlan), ...]}
+        self.bridge_fdb_entries = collections.defaultdict(list)
+
+        # Static neighbors: {irb_device: [(ip, mac), ...]}
+        self.static_neighbors = collections.defaultdict(list)
+
+        # OVN connection handles
         self._sb_idl = None
         self._post_fork_event = threading.Event()
 
     @property
     def sb_idl(self):
+        """Lazy-initialized SB IDL"""
         if not self._sb_idl:
             self._post_fork_event.wait()
         return self._sb_idl
@@ -67,777 +108,1399 @@ class OVNEVPNDriver(driver_api.AgentDriverBase):
         self._sb_idl = val
 
     def start(self):
+        """Initialize EVPN driver and set up infrastructure."""
+        LOG.info("=" * 80)
+        LOG.info("Starting OVN EVPN Driver")
+        LOG.info("=" * 80)
+
+        # Initialize OVS connection
         self.ovs_idl = ovs.OvsIdl()
         self.ovs_idl.start(CONF.ovsdb_connection)
         self.chassis = self.ovs_idl.get_own_chassis_id()
         self.ovn_remote = self.ovs_idl.get_ovn_remote()
-        LOG.debug("Loaded chassis %s.", self.chassis)
+        LOG.info("Loaded chassis: %s", self.chassis)
+        LOG.info("OVN remote: %s", self.ovn_remote)
 
+        # Validate configuration
+        if CONF.exposing_method not in [
+            constants.EXPOSE_METHOD_VRF,
+            constants.EXPOSE_METHOD_DYNAMIC
+        ]:
+            LOG.error("EVPN driver requires exposing_method=vrf or dynamic")
+            raise agent_exc.UnsupportedWiringConfig(
+                method=CONF.exposing_method)
+
+        LOG.info("EVPN exposing method: %s", CONF.exposing_method)
+
+        # Set up EVPN prerequisites
+        try:
+            self._ensure_evpn_prerequisites()
+        except Exception as e:
+            LOG.exception("Failed to set up EVPN prerequisites: %s", e)
+            raise
+
+        # Clear VRF routes on startup if configured
+        if CONF.clear_vrf_routes_on_startup:
+            LOG.info("Clearing VRF routes on startup")
+            linux_net.delete_routes_from_table(CONF.bgp_vrf_table_id)
+
+        # Start OVN SB IDL with event watchers
+        LOG.info("Starting OVN SB IDL with EVPN watchers")
         self._post_fork_event.clear()
-
         events = self._get_events()
         self.sb_idl = ovn.OvnSbIdl(
             self.ovn_remote,
             chassis=self.chassis,
             tables=OVN_TABLES,
-            events=events).start()
-
-        # Now IDL connections can be safely used
+            events=events
+        ).start()
         self._post_fork_event.set()
 
-    def _get_events(self):
-        return {watcher.PortBindingChassisCreatedEvent(self),
-                watcher.PortBindingChassisDeletedEvent(self),
-                watcher.SubnetRouterAttachedEvent(self),
-                watcher.SubnetRouterDetachedEvent(self),
-                watcher.TenantPortCreatedEvent(self),
-                watcher.TenantPortDeletedEvent(self),
-                base_watcher.ChassisCreateEvent(self),
-                base_watcher.ChassisPrivateCreateEvent(self),
-                watcher.LocalnetCreateDeleteEvent(self)}
+        LOG.info("OVN EVPN Driver started successfully")
+        LOG.info("=" * 80)
 
-    @lockutils.synchronized('evpn')
-    def frr_sync(self):
-        # Note(ltomasbo): There is no need for resync on this as there is
-        # no base configuration to be made, but one added when subnets are
-        # exposed, so the sync action takes care of it
-        pass
+    def _ensure_evpn_prerequisites(self):
+        """Ensure EVPN prerequisites are configured.
+
+        - Main EVPN bridge (br-evpn)
+        - Veth pair to OVS (veth-to-ovs <-> veth-to-evpn)
+        - Base FRR EVPN configuration
+        """
+        LOG.info("Setting up EVPN prerequisites")
+
+        # Get configuration
+        bridge_name = CONF.evpn_bridge
+        evpn_veth = CONF.evpn_bridge_veth
+        ovs_veth = CONF.evpn_ovs_veth
+        ovs_bridge = CONF.ovs_bridge
+
+        # Create main EVPN bridge
+        LOG.info("Creating EVPN bridge: %s", bridge_name)
+        linux_net.ensure_bridge(bridge_name)
+
+        # Set bridge properties
+        linux_net.set_device_state(bridge_name, 'up')
+
+        # Create veth pair if not exists
+        if not driver_utils.get_interface(evpn_veth):
+            LOG.info("Creating veth pair: %s <-> %s", evpn_veth, ovs_veth)
+            driver_utils.add_veth(evpn_veth, ovs_veth)
+
+        # Attach evpn_veth to EVPN bridge
+        linux_net.set_master_for_device(evpn_veth, bridge_name)
+        linux_net.set_device_state(evpn_veth, 'up')
+
+        # Attach ovs_veth to OVS bridge
+        linux_net.set_device_state(ovs_veth, 'up')
+        self._ensure_ovs_veth_port(ovs_veth, ovs_bridge)
+
+        # Configure base FRR EVPN
+        LOG.info("Configuring base FRR EVPN settings")
+        frr.ensure_evpn_base_config()
+
+        LOG.info("EVPN prerequisites ready")
+
+    def _ensure_ovs_veth_port(self, veth_name, bridge_name):
+        """Ensure veth is added to OVS bridge."""
+        try:
+            # Check if port already exists
+            from ovn_bgp_agent.privileged import ovs_vsctl
+
+            ports = ovs_vsctl.ovs_cmd(
+                'list-ports', [bridge_name])
+
+            if veth_name not in ports:
+                LOG.info("Adding %s to OVS bridge %s", veth_name, bridge_name)
+                ovs_vsctl.ovs_cmd('add-port', [bridge_name, veth_name])
+        except Exception as e:
+            LOG.warning("Failed to add OVS port %s: %s", veth_name, e)
+
+    def _get_events(self):
+        """Get event watchers for EVPN driver."""
+        LOG.debug("Registering EVPN event watchers")
+
+        events = {
+            # EVPN-specific events (from evpn_watcher.py)
+            evpn_watcher.SubnetRouterAttachedEvent(self),
+            evpn_watcher.SubnetRouterDetachedEvent(self),
+            evpn_watcher.PortBindingChassisCreatedEvent(self),
+            evpn_watcher.PortBindingChassisDeletedEvent(self),
+            evpn_watcher.LocalnetCreateDeleteEvent(self),
+            evpn_watcher.PortAssociationCreatedEvent(self),
+            evpn_watcher.PortAssociationDeletedEvent(self),
+        }
+
+        # Add tenant network events if enabled
+        if CONF.expose_tenant_networks:
+            LOG.info("Enabling tenant network exposure")
+            events.update({
+                evpn_watcher.TenantPortCreatedEvent(self),
+                evpn_watcher.TenantPortDeletedEvent(self),
+            })
+
+        return events
+
+    # =========================================================================
+    # Sync operations
+    # =========================================================================
 
     @lockutils.synchronized('evpn')
     def sync(self):
-        self.ovn_local_cr_lrps = {}
-        self.ovn_local_lrps = {}
-        self._ovn_routing_tables_routes = collections.defaultdict()
-        self._ovn_exposed_evpn_ips = collections.defaultdict()
+        """Synchronize EVPN state with OVN database.
 
-        # 1) Get bridge mappings: xxxx:br-ex,yyyy:br-ex2
-        bridge_mappings = self.ovs_idl.get_ovn_bridge_mappings()
-        # 2) Get macs for bridge mappings
-        for bridge_index, bridge_mapping in enumerate(bridge_mappings, 1):
-            network, bridge = helpers.parse_bridge_mapping(bridge_mapping)
-            if not network:
+        Called periodically to ensure all EVPN resources match OVN state.
+        """
+        LOG.info("=" * 80)
+        LOG.info("Starting EVPN sync")
+        LOG.info("=" * 80)
+
+        # Reset tracking structures
+        self.evpn_networks = {}
+        self.evpn_ports = {}
+        self.bridge_fdb_entries = collections.defaultdict(list)
+        self.static_neighbors = collections.defaultdict(list)
+
+        # Get all Port_Bindings with EVPN configuration
+        evpn_ports = self._get_evpn_ports()
+
+        LOG.info("Found %d ports with EVPN configuration", len(evpn_ports))
+
+        # Group by network
+        networks_with_ports = collections.defaultdict(list)
+        for port in evpn_ports:
+            try:
+                datapath_uuid = str(port.datapath.uuid)
+                networks_with_ports[datapath_uuid].append(port)
+            except (AttributeError, IndexError) as e:
+                LOG.warning("Failed to get datapath for port %s: %s",
+                            port.logical_port, e)
                 continue
-            self.ovn_bridge_mappings[network] = bridge
 
-            linux_net.ensure_arp_ndp_enabled_for_bridge(bridge, bridge_index)
+        # Process each network
+        for network_id, ports in networks_with_ports.items():
+            self._sync_network(network_id, ports)
 
-        # TO DO
-        # add missing routes/ips for fips/provider VMs
-        ports = self.sb_idl.get_ports_on_chassis(self.chassis)
-        for port in ports:
-            if port.type != constants.OVN_CHASSISREDIRECT_VIF_PORT_TYPE:
-                continue
-            self._expose_ip(port, cr_lrp=True)
+        # Clean up orphaned resources
+        self._cleanup_orphaned_resources()
 
-        self._remove_extra_exposed_ips()
-        self._remove_extra_routes()
-        self._remove_extra_ovs_flows()
-        self._remove_extra_vrfs()
+        LOG.info("EVPN sync completed")
+        LOG.info("  Active networks: %d", len(self.evpn_networks))
+        LOG.info("  Active VRFs: %d", len(self.evpn_vrfs))
+        LOG.info("  Tracked ports: %d", len(self.evpn_ports))
+        LOG.info("=" * 80)
 
-    def _ensure_network_exposed(self, router_port, gateway):
-        evpn_info = self.sb_idl.get_evpn_info_from_port_name(
-            router_port.logical_port)
-        if not evpn_info:
-            LOG.debug("No EVPN information for LRP Port %s. "
-                      "Not exposing it.", router_port)
-            return
+    def _get_evpn_ports(self):
+        """Get all Port_Bindings with EVPN external_ids."""
+        evpn_ports = []
 
-        gateway_ips = [ip.split('/')[0] for ip in gateway['ips']]
         try:
-            router_port_ip = router_port.mac[0].strip().split(' ')[1]
-        except IndexError:
+            all_ports = self.sb_idl.db_list_rows('Port_Binding').execute()
+
+            for port in all_ports:
+                # Check if port has EVPN configuration
+                if (port.external_ids.get(constants.OVN_EVPN_VNI_EXT_ID_KEY) and
+                        port.external_ids.get(constants.OVN_EVPN_AS_EXT_ID_KEY)):
+                    evpn_ports.append(port)
+
+        except Exception as e:
+            LOG.error("Failed to get EVPN ports: %s", e)
+
+        return evpn_ports
+
+    def _sync_network(self, network_id, ports):
+        """Sync a single network and its ports.
+
+        :param network_id: OVN datapath UUID
+        :param ports: List of Port_Binding rows with EVPN config
+        """
+        LOG.debug("Syncing network %s with %d ports", network_id, len(ports))
+
+        # Extract EVPN configuration from first port (all should be same)
+        network_info = self._build_network_info(network_id, ports[0])
+        if not network_info:
+            LOG.warning("Failed to build network info for %s", network_id)
             return
-        router_ip = router_port_ip.split('/')[0]
-        if router_ip in gateway_ips:
+
+        # Ensure network infrastructure (VNI, VRF, IRB)
+        if not self._ensure_network_infrastructure(network_info):
+            LOG.warning("Failed to ensure infrastructure for %s", network_id)
             return
-        self.ovn_local_lrps[router_port.logical_port] = {
-            'datapath': router_port.datapath,
-            'ip': router_port_ip
+
+        # Store network info
+        self.evpn_networks[network_id] = network_info
+
+        # Process all ports on this network
+        for port in ports:
+            self._sync_port(port, network_info)
+
+    def _build_network_info(self, network_id, sample_port):
+        """Build network info dict from Port_Binding external_ids.
+
+        :param network_id: Network datapath UUID
+        :param sample_port: Sample Port_Binding with EVPN config
+        :return: Dict with network info or None
+        """
+        try:
+            ext_ids = sample_port.external_ids
+
+            # Get VLAN ID from network
+            datapath = sample_port.datapath
+            network_name, vlan_tag = self.sb_idl.get_network_name_and_tag(
+                str(datapath.uuid),
+                self.ovs_idl.get_ovn_bridge_mappings().keys())
+
+            if not vlan_tag:
+                LOG.debug("Network %s has no VLAN tag", network_id)
+                return None
+
+            vlan_id = vlan_tag[0]
+
+            # Extract EVPN configuration from external_ids
+            vni = int(ext_ids.get(constants.OVN_EVPN_VNI_EXT_ID_KEY))
+            evpn_type = ext_ids.get(
+                constants.OVN_EVPN_TYPE_EXT_ID_KEY, 'l3')
+            bgp_as = ext_ids.get(constants.OVN_EVPN_AS_EXT_ID_KEY)
+
+            # Parse route targets (JSON array)
+            route_targets = self._parse_route_targets(ext_ids)
+
+            # Parse route distinguishers (JSON array)
+            route_distinguishers = self._parse_route_distinguishers(ext_ids)
+
+            # Parse import/export targets
+            import_targets = self._parse_import_targets(ext_ids)
+            export_targets = self._parse_export_targets(ext_ids)
+
+            # Parse local preference
+            local_pref = ext_ids.get(constants.OVN_EVPN_LOCAL_PREF_EXT_ID_KEY)
+
+            # Get MTU from datapath or config
+            mtu = self._get_network_mtu(datapath)
+
+            # Determine L2VNI and L3VNI based on type
+            if evpn_type == 'l2':
+                l2vni = vni
+                l3vni = None
+            elif evpn_type == 'l3':
+                l2vni = None
+                l3vni = vni
+            else:
+                # Default: use as L3VNI
+                l2vni = None
+                l3vni = vni
+
+            # Check if l2vni_offset is configured
+            if l2vni is None and CONF.l2vni_offset:
+                l2vni = vlan_id + int(CONF.l2vni_offset)
+                LOG.debug("Calculated L2VNI=%d from VLAN %d + offset %d",
+                          l2vni, vlan_id, CONF.l2vni_offset)
+
+            return {
+                'id': network_id,
+                'vlan_id': vlan_id,
+                'l2vni': l2vni,
+                'l3vni': l3vni,
+                'type': evpn_type,
+                'bgp_as': bgp_as,
+                'route_targets': route_targets,
+                'route_distinguishers': route_distinguishers,
+                'import_targets': import_targets,
+                'export_targets': export_targets,
+                'local_pref': local_pref,
+                'mtu': mtu,
             }
-        datapath_bridge, vlan_tag = self._get_bridge_for_datapath(
-            gateway['provider_datapath'])
 
-        network_datapath = self.sb_idl.get_port_datapath(
-            router_port.options['peer'])
+        except Exception as e:
+            LOG.exception("Failed to build network info: %s", e)
+            return None
 
-        self._expose_subnet(router_port_ip, gateway_ips, gateway,
-                            datapath_bridge, vlan_tag, network_datapath)
+    def _sync_port(self, port, network_info):
+        """Sync single port - add FDB and neighbor entries.
 
-    def _get_bridge_for_datapath(self, datapath):
-        network_name, network_tag = self.sb_idl.get_network_name_and_tag(
-            datapath, self.ovn_bridge_mappings.keys())
-        if network_name:
-            if network_tag:
-                return self.ovn_bridge_mappings[network_name], network_tag[0]
-            return self.ovn_bridge_mappings[network_name], None
-        return None, None
+        :param port: Port_Binding row
+        :param network_info: Network information dict
+        """
+        if not port.mac or port.mac == ['unknown']:
+            LOG.debug("Port %s has no MAC, skipping", port.logical_port)
+            return
 
-    @lockutils.synchronized('evpn')
-    def expose_ip(self, row, cr_lrp=False):
-        '''Advertice BGP route through EVPN.
-
-        This methods ensures BGP advertises the IP through the required
-        VRF/Tenant by using the specified VNI/VXLAN id.
-
-        It relies on Zebra, which creates and advertises a route when an IP
-        is added to a interface in the related VRF.
-        '''
-        self._expose_ip(row, cr_lrp)
-
-    def _expose_ip(self, row, cr_lrp=False):
-        if cr_lrp:
-            cr_lrp_port_name = row.logical_port
-            cr_lrp_port = row
-        else:
-            cr_lrp_port_name = 'cr-lrp-' + row.logical_port
-            cr_lrp_port = self.sb_idl.get_port_if_local_chassis(
-                cr_lrp_port_name, self.chassis)
-            if not cr_lrp_port:
-                # Not in local chassis, no need to proccess
+        # Parse MAC and IPs
+        try:
+            mac_ips = port.mac[0].strip().split()
+            if len(mac_ips) < 1:
                 return
 
-        _, cr_lrp_datapath = self.sb_idl.get_fip_associated(
-            cr_lrp_port_name)
-        if not cr_lrp_datapath:
+            mac_address = mac_ips[0]
+            ip_addresses = mac_ips[1:] if len(mac_ips) > 1 else []
+        except (IndexError, AttributeError) as e:
+            LOG.debug("Failed to parse port MAC/IPs: %s", e)
             return
 
-        if len(cr_lrp_port.mac[0].strip().split(' ')) < 2:
-            return
-        ips = cr_lrp_port.mac[0].strip().split(' ')[1:]
+        vlan_id = network_info['vlan_id']
+        bridge_name = CONF.evpn_bridge
 
-        if cr_lrp:
-            evpn_info = self.sb_idl.get_evpn_info_from_port_name(
-                cr_lrp_port_name)
-        else:
-            evpn_info = self.sb_idl.get_evpn_info(row)
-        if not evpn_info:
-            LOG.debug("No EVPN information for CR-LRP Port with IPs %s. "
-                      "Not exposing it.", ips)
-            return
+        # Add static FDB entry for L2VNI
+        if network_info.get('l2vni'):
+            self._ensure_fdb_entry(mac_address, vlan_id, bridge_name)
 
-        datapath_bridge, vlan_tag = self._get_bridge_for_datapath(
-            cr_lrp_datapath)
+        # Add static neighbor entries for L3VNI
+        if network_info.get('l3vni') is not None and ip_addresses:
+            irb_device = f'{bridge_name}.{vlan_id}'
+            for ip in ip_addresses:
+                self._ensure_neighbor_entry(ip, mac_address, irb_device)
 
-        LOG.info("Adding BGP route for CR-LRP Port %s on AS %s and "
-                 "VNI %s", ips, evpn_info['bgp_as'], evpn_info['vni'])
-        evpn_devices = self._ensure_evpn_devices(datapath_bridge,
-                                                 evpn_info['vni'],
-                                                 vlan_tag)
-        if not evpn_devices.vrf_name or not evpn_devices.lo_name:
-            return
-
-        self.ovn_local_cr_lrps[cr_lrp_port_name] = {
-            'router_datapath': cr_lrp_port.datapath,
-            'provider_datapath': cr_lrp_datapath,
-            'ips': ips,
-            'mac': cr_lrp_port.mac[0].strip().split(' ')[0],
-            'vni': int(evpn_info['vni']),
-            'bgp_as': evpn_info['bgp_as'],
-            'lo': evpn_devices.lo_name,
-            'bridge': evpn_devices.bridge_name,
-            'vxlan': evpn_devices.vxlan_name,
-            'vrf': evpn_devices.vrf_name,
-            'veth_vrf': evpn_devices.veth_vrf,
-            'veth_ovs': evpn_devices.veth_ovs,
-            'vlan': evpn_devices.vlan_name
+        # Track port
+        self.evpn_ports[port.logical_port] = {
+            'mac': mac_address,
+            'ips': ip_addresses,
+            'network_id': network_info['id'],
+            'vlan_id': vlan_id,
         }
 
-        frr.vrf_reconfigure(evpn_info, action="add-vrf")
+    # =========================================================================
+    # Network infrastructure management
+    # =========================================================================
 
-        self._connect_evpn_to_ovn(evpn_devices.vrf_name, evpn_devices.veth_vrf,
-                                  evpn_devices.veth_ovs, ips, datapath_bridge,
-                                  evpn_info['vni'], evpn_devices.vlan_name,
-                                  vlan_tag)
+    def _ensure_network_infrastructure(self, network_info):
+        """Ensure network EVPN infrastructure is configured.
 
-        ips_without_mask = [ip.split("/")[0] for ip in ips]
-        nei_dev = evpn_devices.vlan_name if vlan_tag else evpn_devices.veth_vrf
-        for ip in ips_without_mask:
-            linux_net.add_ip_nei(
-                ip, self.ovn_local_cr_lrps[cr_lrp_port_name]['mac'], nei_dev)
+        Creates:
+        - L2VNI VXLAN device (if l2vni configured)
+        - VRF (if l3vni configured)
+        - L3VNI VXLAN device (if l3vni > 0)
+        - IRB device (if l3vni configured)
 
-        # Check if there are networks attached to the router,
-        # and if so, add the needed routes/rules
-        lrp_ports = self.sb_idl.get_lrp_ports_for_router(
-            cr_lrp_port.datapath)
-        for lrp in lrp_ports:
-            if lrp.chassis or "chassis-redirect-port" in lrp.options.keys():
-                continue
-            self._ensure_network_exposed(
-                lrp, self.ovn_local_cr_lrps[cr_lrp_port_name])
+        :param network_info: Network information dict
+        :return: True if successful
+        """
+        network_id = network_info['id']
+        vlan_id = network_info['vlan_id']
+        l2vni = network_info['l2vni']
+        l3vni = network_info['l3vni']
 
-    @lockutils.synchronized('evpn')
-    def withdraw_ip(self, row, cr_lrp=False):
-        '''Withdraw BGP route through EVPN.
-
-        This methods ensures BGP withdraw the IP advertised through the
-        required VRF/Tenant by using the specified VNI/VXLAN id.
-
-        It relies on Zebra, which cwithdraws the advertisement as son as the
-        IP is deleted from the interface in the related VRF.
-        '''
-        if cr_lrp:
-            cr_lrp_port_name = row.logical_port
-        else:
-            cr_lrp_port_name = 'cr-lrp-' + row.logical_port
-
-        cr_lrp_info = self.ovn_local_cr_lrps.get(cr_lrp_port_name, {})
-        if not cr_lrp_info:
-            # This means it is in a different chassis
-            return
-        cr_lrp_datapath = cr_lrp_info.get('provider_datapath')
-        if not cr_lrp_datapath:
-            return
-
-        ips = cr_lrp_info.get('ips')
-        evpn_vni = cr_lrp_info.get('vni')
-        if not evpn_vni:
-            LOG.debug("No EVPN information for CR-LRP Port with IPs %s. "
-                      "No need to withdraw it.", ips)
-            return
-
-        LOG.info("Delete BGP route for CR-LRP Port %s on VNI %s", ips,
-                 evpn_vni)
-        datapath_bridge, vlan_tag = self._get_bridge_for_datapath(
-            cr_lrp_datapath)
-
-        if vlan_tag:
-            self._disconnect_evpn_from_ovn(evpn_vni, datapath_bridge, ips,
-                                           vlan_tag=vlan_tag)
-        else:
-            cr_lrps_on_same_provider = [
-                p for p in self.ovn_local_cr_lrps.values()
-                if p['provider_datapath'] == cr_lrp_datapath]
-            if (len(cr_lrps_on_same_provider) > 1):
-                # NOTE: no need to remove the NDP proxy if there are other
-                # cr-lrp ports on the same chassis connected to the same
-                # provider flat network
-                self._disconnect_evpn_from_ovn(evpn_vni, datapath_bridge, ips,
-                                               cleanup_ndp_proxy=False)
-            else:
-                self._disconnect_evpn_from_ovn(evpn_vni, datapath_bridge, ips)
-
-        nei_dev = cr_lrp_info['vlan'] if vlan_tag else cr_lrp_info['veth_vrf']
-        for ip in ips:
-            linux_net.del_ip_nei(ip, cr_lrp_info['mac'], nei_dev)
-
-        self._remove_evpn_devices(evpn_vni)
-        ovs.remove_evpn_router_ovs_flows(datapath_bridge,
-                                         constants.OVS_VRF_RULE_COOKIE,
-                                         cr_lrp_info.get('mac'))
-
-        evpn_info = {'vni': evpn_vni, 'bgp_as': cr_lrp_info.get('bgp_as')}
-        frr.vrf_reconfigure(evpn_info, action="del-vrf")
+        LOG.info("Ensuring infrastructure for network %s", network_id)
+        LOG.info("  VLAN: %s, L2VNI: %s, L3VNI: %s, Type: %s",
+                 vlan_id, l2vni, l3vni, network_info['type'])
 
         try:
-            del self.ovn_local_cr_lrps[cr_lrp_port_name]
-        except KeyError:
-            LOG.debug("Gateway port already cleanup from the agent: %s",
-                      cr_lrp_port_name)
+            bridge_name = CONF.evpn_bridge
+            local_ip = self._get_local_vtep_ip()
 
-    @lockutils.synchronized('evpn')
-    def expose_remote_ip(self, ips, row):
-        if self.sb_idl.is_provider_network(row.datapath):
-            return
-        port_lrps = self.sb_idl.get_lrps_for_datapath(row.datapath)
-        for port_lrp in port_lrps:
-            if port_lrp in self.ovn_local_lrps.keys():
-                evpn_info = self.sb_idl.get_evpn_info_from_port_name(port_lrp)
-                if not evpn_info:
-                    LOG.debug("No EVPN information for LRP Port %s. "
-                              "Not exposing IPs: %s.", port_lrp, ips)
-                    continue
-                LOG.info("Add BGP route for tenant IP %s on chassis %s",
-                         ips, self.chassis)
-                lo_name = constants.OVN_EVPN_LO_PREFIX + str(evpn_info['vni'])
-                linux_net.add_ips_to_dev(
-                    lo_name, ips, clear_local_route_at_table=evpn_info['vni'])
-                self._ovn_exposed_evpn_ips.setdefault(
-                    lo_name, []).extend(ips)
+            # Create L2VNI if configured
+            if l2vni:
+                self._ensure_l2vni(l2vni, vlan_id, bridge_name, local_ip,
+                                   network_info['mtu'])
 
-    @lockutils.synchronized('evpn')
-    def withdraw_remote_ip(self, ips, row):
-        if self.sb_idl.is_provider_network(row.datapath):
+            # Create VRF and IRB if L3VNI configured
+            if l3vni is not None:
+                self._ensure_l3vni_infrastructure(
+                    l3vni, vlan_id, bridge_name, local_ip,
+                    network_info)
+
+            return True
+
+        except Exception as e:
+            LOG.exception("Failed to ensure infrastructure for %s: %s",
+                          network_id, e)
+            return False
+
+    def _ensure_l2vni(self, l2vni, vlan_id, bridge_name, local_ip, mtu):
+        """Create L2VNI VXLAN device.
+
+        :param l2vni: L2VNI number
+        :param vlan_id: VLAN ID
+        :param bridge_name: Bridge name
+        :param local_ip: Local VTEP IP
+        :param mtu: MTU size
+        """
+        vxlan_name = f'{constants.OVN_EVPN_VXLAN_PREFIX}{l2vni}'
+
+        LOG.info("Creating L2VNI %s (device: %s)", l2vni, vxlan_name)
+
+        # Create VXLAN device
+        linux_net.ensure_vxlan(
+            vxlan_name,
+            l2vni,
+            local_ip,
+            dstport=CONF.evpn_udp_dstport
+        )
+
+        # Set MTU
+        driver_utils.set_device_mtu(vxlan_name, mtu)
+
+        # Attach to bridge
+        linux_net.set_master_for_device(vxlan_name, bridge_name)
+
+        # Disable learning (EVPN controls FDB)
+        linux_net.set_bridge_port_learning(vxlan_name, False)
+        linux_net.set_bridge_port_neigh_suppress(vxlan_name, True)
+
+        # Bring up
+        linux_net.set_device_state(vxlan_name, 'up')
+
+        # Add VLAN to bridge and VXLAN port
+        linux_net.ensure_bridge_vlan(bridge_name, vlan_id,
+                                     tagged=True, pvid=False, untagged=False)
+
+        # Make VLAN untagged on VXLAN port
+        veth_port = CONF.evpn_bridge_veth
+        linux_net.ensure_bridge_vlan(veth_port, vlan_id,
+                                     tagged=False, pvid=True, untagged=True)
+
+        LOG.debug("L2VNI %s created successfully", l2vni)
+
+    def _ensure_l3vni_infrastructure(self, l3vni, vlan_id, bridge_name,
+                                     local_ip, network_info):
+        """Create L3VNI, VRF, and IRB infrastructure.
+
+        :param l3vni: L3VNI number (0 for underlay leak, >0 for EVPN)
+        :param vlan_id: VLAN ID
+        :param bridge_name: Bridge name
+        :param local_ip: Local VTEP IP
+        :param network_info: Network info dict
+        """
+        vrf_name = f'{constants.OVN_EVPN_VRF_PREFIX}{l3vni}'
+        table_id = l3vni + 1000000  # Large offset
+
+        LOG.info("Creating L3VNI infrastructure: VRF=%s, L3VNI=%s",
+                 vrf_name, l3vni)
+
+        # Create or reuse VRF
+        if vrf_name not in self.evpn_vrfs:
+            linux_net.ensure_vrf(vrf_name, table_id)
+            linux_net.set_device_state(vrf_name, 'up')
+
+            # Configure FRR for this VRF
+            leak_to_underlay = (l3vni == 0)
+
+            # Build FRR EVPN info with all parameters
+            evpn_info = {
+                'vrf_name': vrf_name,
+                'vni': l3vni if l3vni > 0 else 0,
+                'bgp_as': network_info['bgp_as'],
+                'route_targets': network_info.get('route_targets', []),
+                'route_distinguishers': network_info.get('route_distinguishers', []),
+                'import_targets': network_info.get('import_targets', []),
+                'export_targets': network_info.get('export_targets', []),
+                'local_ip': local_ip,
+            }
+
+            # Add local preference if specified
+            if network_info.get('local_pref'):
+                evpn_info['local_pref'] = network_info['local_pref']
+
+            # Configure FRR VRF
+            frr.vrf_reconfigure(evpn_info, 'add-vrf')
+
+            # Configure route leaking if needed
+            if leak_to_underlay:
+                frr.vrf_leak(vrf_name, CONF.bgp_AS)
+
+            self.evpn_vrfs[vrf_name] = {
+                'table_id': table_id,
+                'l3vni': l3vni,
+                'networks': [],
+            }
+
+        self.evpn_vrfs[vrf_name]['networks'].append(network_info['id'])
+
+        # Create L3VNI VXLAN device if l3vni > 0
+        if l3vni > 0:
+            l3vni_name = f'{constants.OVN_EVPN_VXLAN_PREFIX}l3-{l3vni}'
+            irb_bridge = f'{constants.OVN_EVPN_BRIDGE_PREFIX}{l3vni}'
+
+            # Create IRB bridge for L3VNI
+            linux_net.ensure_bridge(irb_bridge)
+            linux_net.set_master_for_device(irb_bridge, vrf_name)
+            linux_net.set_device_state(irb_bridge, 'up')
+
+            # Create L3VNI VXLAN
+            linux_net.ensure_vxlan(
+                l3vni_name,
+                l3vni,
+                local_ip,
+                dstport=CONF.evpn_udp_dstport
+            )
+
+            driver_utils.set_device_mtu(l3vni_name, network_info['mtu'])
+            linux_net.set_master_for_device(l3vni_name, irb_bridge)
+            linux_net.set_bridge_port_learning(l3vni_name, False)
+            linux_net.set_bridge_port_neigh_suppress(l3vni_name, True)
+            linux_net.set_device_state(l3vni_name, 'up')
+
+        # Create IRB (SVI) for this network
+        self._ensure_irb_device(vlan_id, bridge_name, vrf_name, network_info)
+
+    def _ensure_irb_device(self, vlan_id, bridge_name, vrf_name, network_info):
+        """Create IRB device for network.
+
+        :param vlan_id: VLAN ID
+        :param bridge_name: Bridge name
+        :param vrf_name: VRF name
+        :param network_info: Network info dict
+        """
+        LOG.info("Creating IRB for VLAN %s in VRF %s", vlan_id, vrf_name)
+
+        # Create VLAN device on bridge
+        linux_net.ensure_vlan_device_for_network(bridge_name, vlan_id)
+        irb_device = f'{bridge_name}.{vlan_id}'
+
+        # Attach to VRF
+        linux_net.set_master_for_device(irb_device, vrf_name)
+        linux_net.set_device_state(irb_device, 'up')
+
+        # Enable proxy ARP/NDP for anycast gateway
+        linux_net.enable_proxy_arp(irb_device)
+        linux_net.enable_proxy_ndp(irb_device)
+
+        # Add gateway IPs (extracted from Port_Binding.mac)
+        self._add_gateway_ips_to_irb(irb_device, network_info)
+
+        LOG.debug("IRB %s created in VRF %s", irb_device, vrf_name)
+
+    def _add_gateway_ips_to_irb(self, irb_device, network_info):
+        """Add gateway IPs to IRB device.
+
+        Gateway IPs are extracted from Port_Binding.mac field of router ports.
+        Format: "MAC IP1 IP2 ..."
+
+        :param irb_device: IRB device name
+        :param network_info: Network info dict
+        """
+        # TODO: Query OVN for router interface ports and extract gateway IPs
+        # For now, this is a placeholder
+        LOG.debug("Gateway IP configuration for %s (will be extracted from router ports)",
+                  irb_device)
+
+    # =========================================================================
+    # FDB and Neighbor management
+    # =========================================================================
+
+    def _ensure_fdb_entry(self, mac_address, vlan_id, bridge_device):
+        """Ensure static FDB entry exists on bridge.
+
+        :param mac_address: MAC address
+        :param vlan_id: VLAN ID
+        :param bridge_device: Bridge device name
+        """
+        if not CONF.evpn_static_fdb:
             return
-        port_lrps = self.sb_idl.get_lrps_for_datapath(row.datapath)
-        for port_lrp in port_lrps:
-            if port_lrp in self.ovn_local_lrps.keys():
-                evpn_info = self.sb_idl.get_evpn_info_from_port_name(port_lrp)
-                if not evpn_info:
-                    LOG.debug("No EVPN information for LRP Port %s. "
-                              "Not withdrawing IPs: %s.", port_lrp, ips)
-                    continue
-                LOG.info("Delete BGP route for tenant IP %s on chassis %s",
-                         ips, self.chassis)
-                lo_name = constants.OVN_EVPN_LO_PREFIX + str(evpn_info['vni'])
-                linux_net.del_ips_from_dev(lo_name, ips)
+
+        bridge_port = CONF.evpn_bridge_veth
+
+        key = (mac_address, vlan_id)
+        if key not in self.bridge_fdb_entries[bridge_device]:
+            try:
+                linux_net.add_bridge_fdb(
+                    mac_address,
+                    bridge_port,
+                    vlan=vlan_id,
+                    master=True,
+                    static=True
+                )
+                self.bridge_fdb_entries[bridge_device].append(key)
+                LOG.debug("Added FDB: %s VLAN %s on %s",
+                          mac_address, vlan_id, bridge_port)
+            except Exception as e:
+                # Ignore if already exists
+                if "File exists" not in str(e):
+                    LOG.warning("Failed to add FDB %s: %s", mac_address, e)
+
+    def _ensure_neighbor_entry(self, ip_address, mac_address, irb_device):
+        """Ensure static neighbor entry exists.
+
+        :param ip_address: IP address
+        :param mac_address: MAC address
+        :param irb_device: IRB device name
+        """
+        if not CONF.evpn_static_neighbors:
+            return
+
+        key = (ip_address, mac_address)
+        if key not in self.static_neighbors[irb_device]:
+            try:
+                linux_net.add_ip_nei(ip_address, mac_address, irb_device)
+                self.static_neighbors[irb_device].append(key)
+                LOG.debug("Added neighbor: %s -> %s on %s",
+                          ip_address, mac_address, irb_device)
+            except Exception as e:
+                # Ignore if already exists
+                if "File exists" not in str(e):
+                    LOG.warning("Failed to add neighbor %s: %s", ip_address, e)
+
+    # =========================================================================
+    # Cleanup operations
+    # =========================================================================
+
+    def _cleanup_orphaned_resources(self):
+        """Clean up EVPN resources that are no longer needed."""
+        LOG.debug("Cleaning up orphaned EVPN resources")
+
+        try:
+            all_links = linux_net.get_interfaces()
+
+            # Find orphaned VXLANs
+            for link in all_links:
+                if link.startswith(constants.OVN_EVPN_VXLAN_PREFIX):
+                    # Extract VNI from device name
+                    vni_str = link.replace(constants.OVN_EVPN_VXLAN_PREFIX, '')
+                    vni_str = vni_str.replace('l3-', '')  # Handle L3VNI prefix
+
+                    try:
+                        vni = int(vni_str)
+                        if not self._is_vni_in_use(vni):
+                            LOG.warning("Deleting orphaned VXLAN device: %s", link)
+                            linux_net.delete_device(link)
+                    except ValueError:
+                        LOG.debug("Could not parse VNI from device: %s", link)
+
+                # Find orphaned VRFs
+                elif link.startswith(constants.OVN_EVPN_VRF_PREFIX):
+                    if link not in self.evpn_vrfs:
+                        LOG.warning("Deleting orphaned VRF: %s", link)
+                        # Delete VRF from FRR first
+                        l3vni_str = link.replace(constants.OVN_EVPN_VRF_PREFIX, '')
+                        try:
+                            l3vni = int(l3vni_str)
+                            evpn_info = {'vrf_name': link, 'vni': l3vni}
+                            frr.vrf_reconfigure(evpn_info, 'del-vrf')
+                        except (ValueError, Exception) as e:
+                            LOG.debug("Failed to delete VRF from FRR: %s", e)
+
+                        # Delete VRF device
+                        if CONF.delete_vrf_on_disconnect:
+                            linux_net.delete_device(link)
+
+        except Exception as e:
+            LOG.warning("Failed to clean up orphaned resources: %s", e)
+
+    def _is_vni_in_use(self, vni):
+        """Check if VNI is currently in use.
+
+        :param vni: VNI to check
+        :return: True if in use
+        """
+        for net_info in self.evpn_networks.values():
+            if net_info.get('l2vni') == vni or net_info.get('l3vni') == vni:
+                return True
+        return False
+
+    def _get_local_vtep_ip(self):
+        """Get local VTEP IP address.
+
+        Priority:
+        1. CONF.evpn_local_ip
+        2. IP from CONF.evpn_nic
+        3. First global IPv4 on loopback
+
+        :return: IP address string
+        """
+        # Check config first
+        if CONF.evpn_local_ip:
+            LOG.debug("Using configured VTEP IP: %s", CONF.evpn_local_ip)
+            return str(CONF.evpn_local_ip)
+
+        # Check evpn_nic
+        if CONF.evpn_nic:
+            try:
+                ip_addrs = linux_net.get_ip_addresses(label=CONF.evpn_nic)
+                if ip_addrs:
+                    # Get first IPv4 address
+                    for addr in ip_addrs:
+                        addr_dict = dict(addr['attrs'])
+                        if addr['family'] == constants.AF_INET:
+                            vtep_ip = addr_dict['IFA_ADDRESS']
+                            LOG.debug("Using VTEP IP from %s: %s",
+                                      CONF.evpn_nic, vtep_ip)
+                            return vtep_ip
+            except Exception as e:
+                LOG.warning("Failed to get IP from %s: %s", CONF.evpn_nic, e)
+
+        # Fallback to loopback
+        try:
+            ip_addrs = linux_net.get_ip_addresses(label='lo')
+            for addr in ip_addrs:
+                addr_dict = dict(addr['attrs'])
+                if addr['family'] == constants.AF_INET:
+                    vtep_ip = addr_dict['IFA_ADDRESS']
+                    if not vtep_ip.startswith('127.'):
+                        LOG.debug("Using loopback VTEP IP: %s", vtep_ip)
+                        return vtep_ip
+        except Exception as e:
+            LOG.warning("Failed to get loopback IP: %s", e)
+
+        raise agent_exc.ConfOptionRequired(option='evpn_local_ip or evpn_nic')
+
+    # =========================================================================
+    # Event handler methods (called by evpn_watcher)
+    # =========================================================================
 
     @lockutils.synchronized('evpn')
     def expose_subnet(self, row):
-        evpn_info = self.sb_idl.get_evpn_info(row)
-        ip = self.sb_idl.get_ip_from_port_peer(row)
-        if not evpn_info:
-            LOG.debug("No EVPN information for LRP Port %s. "
-                      "Not exposing IPs: %s.", row.logical_port, ip)
-            return
+        """Handle subnet attachment to router with EVPN config.
 
-        lrp_logical_port = 'lrp-' + row.logical_port
-        lrp_datapath = self.sb_idl.get_port_datapath(lrp_logical_port)
+        Called by SubnetRouterAttachedEvent when a patch port gets
+        EVPN external_ids added.
 
-        cr_lrp = self.sb_idl.is_router_gateway_on_chassis(lrp_datapath,
-                                                          self.chassis)
-        if not cr_lrp:
-            return
+        :param row: Port_Binding row (type=patch)
+        """
+        LOG.info("Exposing EVPN subnet for port %s", row.logical_port)
 
-        LOG.info("Add IP Routes for network %s on chassis %s", ip,
-                 self.chassis)
-        self.ovn_local_lrps[lrp_logical_port] = {
-            'datapath': lrp_datapath,
-            'ip': ip
+        try:
+            # Extract EVPN configuration from Port_Binding external_ids
+            ext_ids = row.external_ids
+            vni = int(ext_ids.get(constants.OVN_EVPN_VNI_EXT_ID_KEY))
+            bgp_as = ext_ids.get(constants.OVN_EVPN_AS_EXT_ID_KEY)
+            evpn_type = ext_ids.get(
+                constants.OVN_EVPN_TYPE_EXT_ID_KEY, 'l3')
+
+            # Get network information
+            datapath = row.datapath
+            network_id = str(datapath.uuid)
+
+            # Get VLAN ID
+            network_name, vlan_tag = self.sb_idl.get_network_name_and_tag(
+                network_id,
+                self.ovs_idl.get_ovn_bridge_mappings().keys())
+
+            if not vlan_tag:
+                LOG.warning("No VLAN tag for network %s", network_id)
+                return
+
+            vlan_id = vlan_tag[0]
+
+            # Parse EVPN parameters
+            route_targets = self._parse_route_targets(ext_ids)
+            route_distinguishers = self._parse_route_distinguishers(ext_ids)
+            import_targets = self._parse_import_targets(ext_ids)
+            export_targets = self._parse_export_targets(ext_ids)
+            local_pref = ext_ids.get(constants.OVN_EVPN_LOCAL_PREF_EXT_ID_KEY)
+
+            # Get MTU
+            mtu = self._get_network_mtu(datapath)
+
+            # Build network info
+            network_info = {
+                'id': network_id,
+                'vlan_id': vlan_id,
+                'l2vni': vni if evpn_type == 'l2' else None,
+                'l3vni': vni if evpn_type == 'l3' else None,
+                'type': evpn_type,
+                'bgp_as': bgp_as,
+                'route_targets': route_targets,
+                'route_distinguishers': route_distinguishers,
+                'import_targets': import_targets,
+                'export_targets': export_targets,
+                'local_pref': local_pref,
+                'mtu': mtu,
             }
 
-        cr_lrp_info = self.ovn_local_cr_lrps.get(cr_lrp, {})
-        cr_lrp_datapath = cr_lrp_info.get('provider_datapath')
-        if not cr_lrp_datapath:
-            LOG.info("Subnet not connected to the provider network. "
-                     "No need to expose it through EVPN")
-            return
-        if (evpn_info['bgp_as'] != cr_lrp_info.get('bgp_as') or
-                evpn_info['vni'] != cr_lrp_info.get('vni')):
-            LOG.error("EVPN information at router port (vni: %s, as: %s) does"
-                      " not match with information at subnet gateway port:"
-                      " %s", cr_lrp_info.get('vni'),
-                      cr_lrp_info.get('bgp_as'), evpn_info)
-            return
+            # Auto-calculate L2VNI if configured
+            if network_info['l2vni'] is None and CONF.l2vni_offset:
+                network_info['l2vni'] = vlan_id + int(CONF.l2vni_offset)
+                LOG.debug("Auto-calculated L2VNI: %d", network_info['l2vni'])
 
-        cr_lrp_ips = [ip_address.split('/')[0]
-                      for ip_address in cr_lrp_info.get('ips', [])]
-        datapath_bridge, vlan_tag = self._get_bridge_for_datapath(
-            cr_lrp_datapath)
+            LOG.info("Network config: VLAN=%s, L2VNI=%s, L3VNI=%s, Type=%s",
+                     vlan_id, network_info['l2vni'],
+                     network_info['l3vni'], evpn_type)
 
-        self._expose_subnet(ip, cr_lrp_ips, cr_lrp_info, datapath_bridge,
-                            vlan_tag, row.datapath)
+            # Configure EVPN infrastructure
+            if self._ensure_network_infrastructure(network_info):
+                self.evpn_networks[network_id] = network_info
 
-    def _expose_subnet(self, router_interface, cr_lrp_ips, cr_lrp_info,
-                       datapath_bridge, vlan_tag, network_datapath):
-        router_interface_ip_version = linux_net.get_ip_version(
-            router_interface)
-        if vlan_tag:
-            dev = cr_lrp_info['vlan']
-            dev_ovs = dev
-            strip_vlan = True
-        else:
-            dev = cr_lrp_info['veth_vrf']
-            dev_ovs = cr_lrp_info['veth_ovs']
-            strip_vlan = False
+                # Extract and add gateway IPs if this is a router port
+                if evpn_type == 'l3':
+                    self._process_router_port_gateway_ips(row, network_info)
 
-        for cr_lrp_ip in cr_lrp_ips:
-            if (linux_net.get_ip_version(cr_lrp_ip) ==
-                    router_interface_ip_version):
-                linux_net.add_ip_route(
-                    self._ovn_routing_tables_routes,
-                    router_interface.split("/")[0],
-                    cr_lrp_info['vni'],
-                    dev,
-                    mask=router_interface.split("/")[1],
-                    via=cr_lrp_ip)
-                break
-
-        if router_interface_ip_version == constants.IP_VERSION_6:
-            net_ip = '{}'.format(ipaddress.IPv6Network(
-                router_interface, strict=False))
-        else:
-            net_ip = '{}'.format(ipaddress.IPv4Network(
-                router_interface, strict=False))
-
-        # NOTE(ltomasbo): strip_vlan is used for subnets/routers associated to
-        # provider vlan networks assuming the EVPN VXLAN header is replacing
-        # the vlan id in the fabric. If that is not the case, we could simply
-        # set this to False in all the cases and have the traffic sent with
-        # both vxlan header (for the EVPN) plus the vlan header (related to
-        # the provider vlan id being used)
-        ovs.ensure_evpn_ovs_flow(datapath_bridge,
-                                 constants.OVS_VRF_RULE_COOKIE,
-                                 cr_lrp_info['mac'],
-                                 dev_ovs,
-                                 dev,
-                                 net_ip,
-                                 strip_vlan=strip_vlan)
-
-        # Check if there are VMs on the network
-        # and if so expose the route
-        if not network_datapath:
-            return
-        ports = self.sb_idl.get_ports_on_datapath(
-            network_datapath)
-        for port in ports:
-            if (port.type not in (constants.OVN_VM_VIF_PORT_TYPE,
-                                  constants.OVN_VIRTUAL_VIF_PORT_TYPE) or
-                (port.type == constants.OVN_VM_VIF_PORT_TYPE and
-                 not port.chassis)):
-                continue
-            try:
-                port_ips = port.mac[0].strip().split(' ')[1:]
-            except IndexError:
-                continue
-
-            for port_ip in port_ips:
-                # Only adding the port ips that match the lrp
-                # IP version
-                port_ip_version = linux_net.get_ip_version(port_ip)
-                if port_ip_version == router_interface_ip_version:
-                    linux_net.add_ips_to_dev(
-                        cr_lrp_info['lo'], [port_ip],
-                        clear_local_route_at_table=cr_lrp_info['vni'])
-                    self._ovn_exposed_evpn_ips.setdefault(
-                        cr_lrp_info['lo'], []).extend([port_ip])
+        except Exception as e:
+            LOG.exception("Failed to expose EVPN subnet: %s", e)
 
     @lockutils.synchronized('evpn')
     def withdraw_subnet(self, row):
-        lrp_logical_port = 'lrp-' + row.logical_port
-        lrp_datapath = self.ovn_local_lrps.get(lrp_logical_port, {}).get(
-            'datapath')
-        ip = self.ovn_local_lrps.get(lrp_logical_port, {}).get('ip')
-        if not lrp_datapath:
-            return
+        """Handle subnet detachment from router (EVPN config removed).
 
-        cr_lrp = self.sb_idl.is_router_gateway_on_chassis(lrp_datapath,
-                                                          self.chassis)
-        if not cr_lrp:
-            return
+        Called by SubnetRouterDetachedEvent when EVPN external_ids
+        are removed from a patch port.
 
-        LOG.info("Delete IP Routes for network %s on chassis %s", ip,
-                 self.chassis)
-
-        cr_lrp_info = self.ovn_local_cr_lrps.get(cr_lrp, {})
-        cr_lrp_datapath = cr_lrp_info.get('provider_datapath')
-        if not cr_lrp_datapath:
-            LOG.info("Subnet not connected to the provider network. "
-                     "No need to withdraw it from EVPN")
-            return
-        cr_lrp_ips = [ip_address.split('/')[0]
-                      for ip_address in cr_lrp_info.get('ips', [])]
-        datapath_bridge, vlan_tag = self._get_bridge_for_datapath(
-            cr_lrp_datapath)
-
-        if vlan_tag:
-            dev = cr_lrp_info['vlan']
-        else:
-            dev = cr_lrp_info['veth_vrf']
-
-        ip_version = linux_net.get_ip_version(ip)
-        for cr_lrp_ip in cr_lrp_ips:
-            if linux_net.get_ip_version(cr_lrp_ip) == ip_version:
-                linux_net.del_ip_route(
-                    self._ovn_routing_tables_routes,
-                    ip.split("/")[0],
-                    cr_lrp_info['vni'],
-                    dev,
-                    mask=ip.split("/")[1],
-                    via=cr_lrp_ip)
-                if (linux_net.get_ip_version(cr_lrp_ip) ==
-                        constants.IP_VERSION_6):
-                    net = ipaddress.IPv6Network(ip, strict=False)
-                else:
-                    net = ipaddress.IPv4Network(ip, strict=False)
-                break
-
-        ovs.remove_evpn_network_ovs_flow(datapath_bridge,
-                                         constants.OVS_VRF_RULE_COOKIE,
-                                         cr_lrp_info['mac'],
-                                         '{}'.format(net))
-
-        # Check if there are VMs on the network
-        # and if so withdraw the routes
-        vms_on_net = linux_net.get_exposed_ips_on_network(
-            cr_lrp_info['lo'], net)
-        linux_net.delete_exposed_ips(vms_on_net,
-                                     cr_lrp_info['lo'])
+        :param row: Port_Binding row (type=patch)
+        """
+        LOG.info("Withdrawing EVPN subnet for port %s", row.logical_port)
 
         try:
-            del self.ovn_local_lrps[lrp_logical_port]
-        except KeyError:
-            LOG.debug("Router Interface port already cleanup from the agent "
-                      "%s", lrp_logical_port)
+            datapath = row.datapath
+            network_id = str(datapath.uuid)
 
-    def _ensure_evpn_devices(self, datapath_bridge, vni, vlan_tag):
-        '''Create the needed devices for EVPN connectivity
+            if network_id in self.evpn_networks:
+                network_info = self.evpn_networks[network_id]
 
-        This method creates and associate the needed devices for EVPN
-        connectivity. It creates:
-        - VRF device
-        - Linux Bridge device, associated to the VRF
-        - VXLAN device, using loopback IP, associate to the bridge
-        - Dummy device to expose the IPs, associated to the VRF
-        - If vlan_tag, create vlan device on OVS bridge, associated to the VRF
-        - If no vlan_tag, create veth pair, one end associated to the VRF
+                LOG.info("Cleaning up network %s (VLAN %s)",
+                         network_id, network_info['vlan_id'])
 
-        param datapath_bridge: OVS bridge to connect the vlan device
-        param vni: VNI number to use for vxlan tunnel ids and vrf routing table
-        param vlan_tag: vlan id to use for connectivity
+                # Remove network infrastructure
+                self._cleanup_network_infrastructure(network_info)
 
-        return: a namedtuple with the name of the devices created: vrf_name,
-        lo_name, bridge_name, vxlan_name, veth_vrf, veth_ovs, and vlan_name.
-        '''
-        # ensure vrf device.
-        # NOTE: It uses vni id as table number
-        vrf_name = constants.OVN_EVPN_VRF_PREFIX + str(vni)
-        linux_net.ensure_vrf(vrf_name, vni)
-
-        # ensure bridge device
-        bridge_name = constants.OVN_EVPN_BRIDGE_PREFIX + str(vni)
-        linux_net.ensure_bridge(bridge_name)
-        # connect bridge to vrf
-        linux_net.set_master_for_device(bridge_name, vrf_name)
-
-        # ensure vxlan device
-        vxlan_name = constants.OVN_EVPN_VXLAN_PREFIX + str(vni)
-
-        local_ip = CONF.evpn_local_ip
-        if not local_ip:
-            local_nic = 'lo'
-            prefixlen_filter = 32  # assuming IPv4
-            if CONF.evpn_nic:
-                local_nic = CONF.evpn_nic
-                prefixlen_filter = False
-            # NOTE(ltomasbo): assuming only 1 IP on the device with /32 prefix
-            local_ip = linux_net.get_nic_ip(local_nic, prefixlen_filter)[0]
-
-        if not local_ip:
-            LOG.error("EVPN device must have an IP associated for the "
-                      "VXLAN local ip")
-            return None, None
-        linux_net.ensure_vxlan(vxlan_name, vni, local_ip,
-                               CONF.evpn_udp_dstport)
-        # connect vxlan to bridge
-        linux_net.set_master_for_device(vxlan_name, bridge_name)
-
-        # ensure dummy lo interface
-        lo_name = constants.OVN_EVPN_LO_PREFIX + str(vni)
-        linux_net.ensure_dummy_device(lo_name)
-        # connect dummy to vrf
-        linux_net.set_master_for_device(lo_name, vrf_name)
-
-        if vlan_tag:
-            vlan_name = constants.OVN_EVPN_VLAN_PREFIX + str(vni)
-            # add vlan port to OVS bridge
-            ovs.add_vlan_port_to_ovs_bridge(datapath_bridge, vlan_name,
-                                            vlan_tag)
-            linux_net.set_device_status(vlan_name, constants.LINK_UP)
-            # connect vlan to vrf
-            linux_net.set_master_for_device(vlan_name, vrf_name)
-            # ensure proxy NDP is enabled for ipv6 traffic
-            linux_net.enable_proxy_ndp(vlan_name)
-
-            return EVPN_INFO(vrf_name, lo_name, bridge_name, vxlan_name, None,
-                             None, vlan_name)
-        else:
-            # ensure veth-pair interfaces
-            veth_vrf = constants.OVN_EVPN_VETH_VRF_PREFIX + str(vni)
-            veth_ovs = constants.OVN_EVPN_VETH_OVS_PREFIX + str(vni)
-            linux_net.ensure_veth(veth_vrf, veth_ovs)
-            # connect veth to vrf
-            linux_net.set_master_for_device(veth_vrf, vrf_name)
-
-            return EVPN_INFO(vrf_name, lo_name, bridge_name, vxlan_name,
-                             veth_vrf, veth_ovs, None)
-
-    def _remove_evpn_devices(self, vni):
-        vrf_name = constants.OVN_EVPN_VRF_PREFIX + str(vni)
-        bridge_name = constants.OVN_EVPN_BRIDGE_PREFIX + str(vni)
-        vxlan_name = constants.OVN_EVPN_VXLAN_PREFIX + str(vni)
-        lo_name = constants.OVN_EVPN_LO_PREFIX + str(vni)
-        veth_name = constants.OVN_EVPN_VETH_VRF_PREFIX + str(vni)
-        vlan_name = constants.OVN_EVPN_VLAN_PREFIX + str(vni)
-
-        for device in [lo_name, vrf_name, bridge_name, vxlan_name, veth_name,
-                       vlan_name]:
-            linux_net.delete_device(device)
-
-    def _connect_evpn_to_ovn(self, vrf, veth_vrf, veth_ovs, ips,
-                             datapath_bridge, vni, vlan, vlan_tag):
-        # NOTE(ltomasbo): vlan device is already attached to ovs bridge
-        # when created
-        if not vlan_tag:
-            # add veth to ovs bridge
-            ovs.add_device_to_ovs_bridge(veth_ovs, datapath_bridge)
-
-        # add route for ip to ovs provider bridge (at the vrf routing table)
-        for ip in ips:
-            ip_without_mask = ip.split("/")[0]
-            if vlan_tag:
-                # ip route add GW_PORT_IP dev VLAN_DEVICE table VRF_TABLE_ID
-                linux_net.add_ip_route(
-                    self._ovn_routing_tables_routes, ip_without_mask,
-                    vni, vlan)
-                # add proxy ndp config for ipv6
-                if (linux_net.get_ip_version(ip_without_mask) ==
-                        constants.IP_VERSION_6):
-                    linux_net.add_ndp_proxy(ip, vlan)
+                # Remove from tracking
+                del self.evpn_networks[network_id]
             else:
-                linux_net.add_ip_route(
-                    self._ovn_routing_tables_routes, ip_without_mask,
-                    vni, veth_vrf)
-                # add proxy ndp config for ipv6
-                if (linux_net.get_ip_version(ip_without_mask) ==
-                        constants.IP_VERSION_6):
-                    linux_net.add_ndp_proxy(ip, datapath_bridge)
+                LOG.debug("Network %s not in tracked networks", network_id)
 
-        # add unreachable route to vrf
-        linux_net.add_unreachable_route(vrf)
+        except Exception as e:
+            LOG.exception("Failed to withdraw EVPN subnet: %s", e)
 
-    def _disconnect_evpn_from_ovn(self, vni, datapath_bridge, ips,
-                                  vlan_tag=None, cleanup_ndp_proxy=True):
-        if vlan_tag:
-            # remove vlan from ovs bridge
-            device = constants.OVN_EVPN_VLAN_PREFIX + str(vni)
-        else:
-            # remove veth from ovs bridge
-            device = constants.OVN_EVPN_VETH_OVS_PREFIX + str(vni)
-        ovs.del_device_from_ovs_bridge(device, datapath_bridge)
+    @lockutils.synchronized('evpn')
+    def expose_ip(self, row, cr_lrp=False):
+        """Handle port binding to local chassis.
 
-        linux_net.delete_routes_from_table(vni)
+        Called when:
+        - VM port is bound to this chassis (TenantPortCreatedEvent)
+        - Gateway port is bound to this chassis (PortBindingChassisCreatedEvent)
 
-        if cleanup_ndp_proxy:
-            for ip in ips:
-                if linux_net.get_ip_version(ip) == constants.IP_VERSION_6:
-                    linux_net.del_ndp_proxy(ip, datapath_bridge)
+        :param row: Port_Binding row
+        :param cr_lrp: True if chassisredirect port (gateway)
+        """
+        LOG.debug("expose_ip called for %s (cr_lrp=%s)",
+                  row.logical_port, cr_lrp)
 
-    def _remove_extra_vrfs(self):
-        vrfs, los, bridges, vxlans, veths, vlans = ([], [], [], [], [], [])
-        for cr_lrp_info in self.ovn_local_cr_lrps.values():
-            vrfs.append(cr_lrp_info['vrf'])
-            los.append(cr_lrp_info['lo'])
-            bridges.append(cr_lrp_info['bridge'])
-            vxlans.append(cr_lrp_info['vxlan'])
-            veths.append(cr_lrp_info['veth_vrf'])
-            vlans.append(cr_lrp_info['vlan'])
+        try:
+            # For gateway ports, just log and return
+            if cr_lrp:
+                LOG.debug("Gateway port bound: %s", row.logical_port)
+                return
 
-        filter_out = ["{}.{}".format(key, value[0]['vlan'])
-                      for key, value in self._ovn_routing_tables_routes.items()
-                      if value[0]['vlan']]
+            # Check if port is on EVPN network
+            datapath = row.datapath
+            network_id = str(datapath.uuid)
 
-        interfaces = linux_net.get_interfaces(filter_out)
-        for interface in interfaces:
-            if (interface.startswith(constants.OVN_EVPN_VRF_PREFIX) and
-                    interface not in vrfs):
-                linux_net.delete_device(interface)
-            elif (interface.startswith(constants.OVN_EVPN_LO_PREFIX) and
-                    interface not in los):
-                linux_net.delete_device(interface)
-            elif (interface.startswith(constants.OVN_EVPN_BRIDGE_PREFIX) and
-                    (interface not in bridges and
-                     interface != constants.OVN_INTEGRATION_BRIDGE and
-                     interface not in set(self.ovn_bridge_mappings.values()))):
-                linux_net.delete_device(interface)
-            elif (interface.startswith(constants.OVN_EVPN_VXLAN_PREFIX) and
-                    interface not in vxlans):
-                linux_net.delete_device(interface)
-            elif (interface.startswith(constants.OVN_EVPN_VETH_VRF_PREFIX) and
-                    interface not in veths):
-                linux_net.delete_device(interface)
-                ovs.del_device_from_ovs_bridge(interface)
-            elif (interface.startswith(constants.OVN_EVPN_VLAN_PREFIX) and
-                    interface not in vlans):
-                ovs.del_device_from_ovs_bridge(interface)
+            if network_id not in self.evpn_networks:
+                LOG.debug("Port %s not on EVPN network", row.logical_port)
+                return
 
-    def _remove_extra_routes(self):
-        table_ids = self._get_table_ids()
-        vrf_routes = linux_net.get_routes_on_tables(table_ids)
-        if not vrf_routes:
-            return
-        # remove from vrf_routes the routes that should be kept
-        for device, routes_info in self._ovn_routing_tables_routes.items():
-            for route_info in routes_info:
-                oif = linux_net.get_interface_index(device)
-                if 'gateway' in route_info['route'].keys():  # subnet route
-                    possible_matchings = [
-                        r for r in vrf_routes
-                        if (r.get('dst') == route_info['route']['dst'] and
-                            r['dst_len'] == route_info['route']['dst_len'] and
-                            r.get('gateway') == (
-                                route_info['route']['gateway']) and
-                            r['table'] == route_info['route']['table'])]
-                else:  # cr-lrp
-                    possible_matchings = [
-                        r for r in vrf_routes
-                        if (r.get('dst') == route_info['route']['dst'] and
-                            r['dst_len'] == route_info['route']['dst_len'] and
-                            r.get('oif') == oif and
-                            r['table'] == route_info['route']['table'])]
-                for r in possible_matchings:
-                    vrf_routes.remove(r)
+            network_info = self.evpn_networks[network_id]
 
-        linux_net.delete_ip_routes(vrf_routes)
+            # Parse MAC and IPs
+            if not row.mac or row.mac == ['unknown']:
+                LOG.debug("Port %s has no MAC", row.logical_port)
+                return
 
-    def _remove_extra_ovs_flows(self):
-        cr_lrp_mac_mappings = self._get_cr_lrp_mac_mapping()
-        cookie_id = "cookie={}/-1".format(constants.OVS_VRF_RULE_COOKIE)
-        for bridge in set(self.ovn_bridge_mappings.values()):
-            current_flows = ovs.get_bridge_flows(bridge, filter_=cookie_id)
-            for flow in current_flows:
-                flow_info = ovs.get_flow_info(flow)
-                if not flow_info.get('mac'):
-                    ovs.del_flow(flow, bridge, constants.OVS_VRF_RULE_COOKIE)
-                elif flow_info['mac'] not in cr_lrp_mac_mappings.keys():
-                    ovs.del_flow(flow, bridge, constants.OVS_VRF_RULE_COOKIE)
-                elif flow_info['port']:
-                    if (not flow_info.get('nw_src') and not
-                            flow_info.get('ipv6_src')):
-                        ovs.del_flow(flow, bridge,
-                                     constants.OVS_VRF_RULE_COOKIE)
+            mac_ips = row.mac[0].strip().split()
+            if len(mac_ips) < 1:
+                return
+
+            mac_address = mac_ips[0]
+            ip_addresses = mac_ips[1:] if len(mac_ips) > 1 else []
+
+            LOG.info("Adding FDB/neighbor for %s: MAC=%s, IPs=%s",
+                     row.logical_port, mac_address, ip_addresses)
+
+            # Add static FDB entry
+            if network_info.get('l2vni'):
+                vlan_id = network_info['vlan_id']
+                bridge_name = CONF.evpn_bridge
+                self._ensure_fdb_entry(mac_address, vlan_id, bridge_name)
+
+            # Add static neighbor entries
+            if network_info.get('l3vni') is not None and ip_addresses:
+                vlan_id = network_info['vlan_id']
+                bridge_name = CONF.evpn_bridge
+                irb_device = f'{bridge_name}.{vlan_id}'
+
+                for ip in ip_addresses:
+                    self._ensure_neighbor_entry(ip, mac_address, irb_device)
+
+            # Track port
+            self.evpn_ports[row.logical_port] = {
+                'mac': mac_address,
+                'ips': ip_addresses,
+                'network_id': network_id,
+            }
+
+        except Exception as e:
+            LOG.exception("Failed to expose IP: %s", e)
+
+    @lockutils.synchronized('evpn')
+    def withdraw_ip(self, row, cr_lrp=False):
+        """Handle port unbinding from local chassis.
+
+        Called when:
+        - VM port is unbound from this chassis
+        - Gateway port is unbound from this chassis
+
+        :param row: Port_Binding row
+        :param cr_lrp: True if chassisredirect port
+        """
+        LOG.debug("withdraw_ip called for %s (cr_lrp=%s)",
+                  row.logical_port, cr_lrp)
+
+        try:
+            # Remove from tracking
+            if row.logical_port in self.evpn_ports:
+                port_info = self.evpn_ports[row.logical_port]
+                LOG.info("Removing port %s: MAC=%s, IPs=%s",
+                         row.logical_port, port_info['mac'], port_info['ips'])
+                del self.evpn_ports[row.logical_port]
+
+            # Note: FDB and neighbor cleanup happens in sync()
+            # to avoid race conditions
+
+        except Exception as e:
+            LOG.exception("Failed to withdraw IP: %s", e)
+
+    @lockutils.synchronized('evpn')
+    def expose_remote_ip(self, ips, row):
+        """Handle tenant port on remote chassis.
+
+        For EVPN, we rely on BGP EVPN Type-2 routes rather than
+        explicit remote IP exposure. This is a no-op.
+
+        :param ips: List of IP addresses
+        :param row: Port_Binding row
+        """
+        LOG.debug("expose_remote_ip called for %s (no-op in EVPN mode)",
+                  row.logical_port)
+
+    @lockutils.synchronized('evpn')
+    def withdraw_remote_ip(self, ips, row, chassis=None):
+        """Handle tenant port removal on remote chassis.
+
+        No-op for EVPN driver.
+
+        :param ips: List of IP addresses
+        :param row: Port_Binding row
+        :param chassis: Chassis name
+        """
+        LOG.debug("withdraw_remote_ip called for %s (no-op in EVPN mode)",
+                  row.logical_port)
+
+    @lockutils.synchronized('evpn')
+    def expose_port_association(self, row):
+        """Handle port-specific EVPN configuration (Port Association).
+
+        Port Association allows per-port EVPN config with custom routes.
+        This is triggered when networking-bgpvpn creates a port association
+        and writes EVPN external_ids to the Port_Binding.
+
+        :param row: Port_Binding row (VM port with EVPN external_ids)
+        """
+        LOG.info("Exposing port association for port %s", row.logical_port)
+
+        try:
+            # Get EVPN config from port external_ids
+            ext_ids = row.external_ids
+            vni = int(ext_ids.get(constants.OVN_EVPN_VNI_EXT_ID_KEY))
+            evpn_type = ext_ids.get(constants.OVN_EVPN_TYPE_EXT_ID_KEY, 'l3')
+            bgp_as = ext_ids.get(constants.OVN_EVPN_AS_EXT_ID_KEY)
+
+            # Get network info
+            network_id = str(row.datapath.uuid)
+            network_name, vlan_tag = self.sb_idl.get_network_name_and_tag(
+                network_id,
+                self.ovs_idl.get_ovn_bridge_mappings().keys())
+
+            if not vlan_tag:
+                LOG.warning("No VLAN tag for network %s", network_id)
+                return
+
+            vlan_id = vlan_tag[0]
+
+            # Parse EVPN parameters
+            route_targets = self._parse_route_targets(ext_ids)
+            route_distinguishers = self._parse_route_distinguishers(ext_ids)
+            import_targets = self._parse_import_targets(ext_ids)
+            export_targets = self._parse_export_targets(ext_ids)
+            local_pref = ext_ids.get(constants.OVN_EVPN_LOCAL_PREF_EXT_ID_KEY)
+
+            # Get MTU
+            mtu = self._get_network_mtu(row.datapath)
+
+            # Build network info (similar to expose_subnet)
+            network_info = {
+                'id': network_id,
+                'vlan_id': vlan_id,
+                'l2vni': vni if evpn_type == 'l2' else None,
+                'l3vni': vni if evpn_type == 'l3' else None,
+                'type': evpn_type,
+                'bgp_as': bgp_as,
+                'route_targets': route_targets,
+                'route_distinguishers': route_distinguishers,
+                'import_targets': import_targets,
+                'export_targets': export_targets,
+                'local_pref': local_pref,
+                'mtu': mtu,
+            }
+
+            # Auto-calculate L2VNI if needed
+            if network_info['l2vni'] is None and CONF.l2vni_offset:
+                network_info['l2vni'] = vlan_id + int(CONF.l2vni_offset)
+
+            # Ensure infrastructure exists
+            if not self._ensure_network_infrastructure(network_info):
+                LOG.error("Failed to ensure infrastructure for port %s",
+                          row.logical_port)
+                return
+
+            # Store network info
+            self.evpn_networks[network_id] = network_info
+
+            # Parse port MAC/IPs
+            if not row.mac or row.mac == ['unknown']:
+                LOG.warning("Port %s has no MAC", row.logical_port)
+                return
+
+            mac_ips = row.mac[0].strip().split()
+            if len(mac_ips) < 1:
+                return
+
+            mac_address = mac_ips[0]
+            ip_addresses = mac_ips[1:] if len(mac_ips) > 1 else []
+
+            # Add FDB entry for L2
+            if network_info.get('l2vni'):
+                self._ensure_fdb_entry(mac_address, vlan_id, CONF.evpn_bridge)
+
+            # Add neighbor entries for L3
+            if network_info.get('l3vni') is not None and ip_addresses:
+                irb_device = f'{CONF.evpn_bridge}.{vlan_id}'
+                for ip in ip_addresses:
+                    self._ensure_neighbor_entry(ip, mac_address, irb_device)
+
+            # Process custom routes from port association
+            routes_str = ext_ids.get('neutron_bgpvpn:routes')
+            if routes_str:
+                self._add_port_custom_routes(routes_str, network_info,
+                                             ip_addresses)
+
+            # Track port
+            self.evpn_ports[row.logical_port] = {
+                'mac': mac_address,
+                'ips': ip_addresses,
+                'network_id': network_id,
+                'vlan_id': vlan_id,
+            }
+
+            LOG.info("Port association exposed for %s", row.logical_port)
+
+        except Exception as e:
+            LOG.exception("Failed to expose port association: %s", e)
+
+    @lockutils.synchronized('evpn')
+    def withdraw_port_association(self, row):
+        """Withdraw port association.
+
+        :param row: Port_Binding row
+        """
+        LOG.info("Withdrawing port association for port %s", row.logical_port)
+
+        try:
+            # Simply remove from tracking
+            # Infrastructure cleanup happens in sync()
+            if row.logical_port in self.evpn_ports:
+                del self.evpn_ports[row.logical_port]
+
+            LOG.info("Port association withdrawn for %s", row.logical_port)
+
+        except Exception as e:
+            LOG.exception("Failed to withdraw port association: %s", e)
+
+    # =========================================================================
+    # Helper methods
+    # =========================================================================
+
+    def _process_router_port_gateway_ips(self, port_binding, network_info):
+        """Extract gateway IPs from router port and add to IRB.
+
+        Router interface ports (patch ports) have gateway IPs in their
+        mac field: "MAC IP1 IP2 ..."
+
+        :param port_binding: Port_Binding row
+        :param network_info: Network info dict
+        """
+        try:
+            if not port_binding.mac or port_binding.mac == ['unknown']:
+                return
+
+            mac_ips = port_binding.mac[0].strip().split()
+            if len(mac_ips) < 2:
+                return
+
+            gateway_ips = mac_ips[1:]  # Skip MAC address
+            vlan_id = network_info['vlan_id']
+            bridge_name = CONF.evpn_bridge
+            irb_device = f'{bridge_name}.{vlan_id}'
+
+            LOG.info("Adding gateway IPs to %s: %s", irb_device, gateway_ips)
+
+            for gw_ip in gateway_ips:
+                # Need to determine correct prefix length
+                # For now, use common defaults
+                try:
+                    ip_obj = ipaddress.ip_address(gw_ip)
+
+                    # TODO: Query OVN for actual subnet CIDR
+                    # For now use common defaults
+                    if ip_obj.version == 4:
+                        gw_cidr = f"{gw_ip}/24"
                     else:
-                        dev_info = cr_lrp_mac_mappings[flow_info['mac']]
-                        if dev_info.get('vlan'):
-                            dev = dev_info['vlan']
-                            dev_ovs = dev
-                        else:
-                            dev = dev_info['veth_vrf']
-                            dev_ovs = dev_info['veth_ovs']
-                        dev_ovs_port = ovs.get_device_port_at_ovs(
-                            dev_ovs)
+                        gw_cidr = f"{gw_ip}/64"
 
-                        if dev_ovs_port != flow_info['port']:
-                            ovs.del_flow(flow, bridge,
-                                         constants.OVS_VRF_RULE_COOKIE)
-                        nw_src_ip = nw_src_mask = None
-                        matching_dst = False
-                        if flow_info.get('nw_src'):
-                            nw_src_ip = flow_info['nw_src'].split('/')[0]
-                            nw_src_mask = int(
-                                flow_info['nw_src'].split('/')[1])
-                        elif flow_info.get('ipv6_src'):
-                            nw_src_ip = flow_info['ipv6_src'].split('/')[0]
-                            nw_src_mask = int(
-                                flow_info['ipv6_src'].split('/')[1])
+                    driver_utils.add_ips_to_dev(irb_device, [gw_cidr])
+                    LOG.info("Added gateway IP %s to %s", gw_cidr, irb_device)
 
-                        for route_info in self._ovn_routing_tables_routes[
-                                dev]:
-                            if (route_info['route']['dst'] == nw_src_ip and
-                                    route_info['route'][
-                                        'dst_len'] == nw_src_mask):
-                                matching_dst = True
-                        if not matching_dst:
-                            ovs.del_flow(flow, bridge,
-                                         constants.OVS_VRF_RULE_COOKIE)
+                except Exception as e:
+                    LOG.warning("Failed to add gateway IP %s: %s", gw_ip, e)
 
-    def _remove_extra_exposed_ips(self):
-        for lo, ips in self._ovn_exposed_evpn_ips.items():
-            exposed_ips_on_device = linux_net.get_exposed_ips(lo)
-            for ip in exposed_ips_on_device:
-                if ip not in ips:
-                    linux_net.del_ips_from_dev(lo, [ip])
+        except Exception as e:
+            LOG.warning("Failed to process gateway IPs: %s", e)
 
-    def _get_table_ids(self):
-        table_ids = []
-        for cr_lrp_info in self.ovn_local_cr_lrps.values():
-            table_ids.append(cr_lrp_info['vni'])
-        return table_ids
+    def _cleanup_network_infrastructure(self, network_info):
+        """Remove network infrastructure.
 
-    def _get_cr_lrp_mac_mapping(self):
-        mac_mappings = {}
-        for cr_lrp_info in self.ovn_local_cr_lrps.values():
-            mac_mappings[cr_lrp_info['mac']] = {
-                'veth_vrf': cr_lrp_info['veth_vrf'],
-                'veth_ovs': cr_lrp_info['veth_ovs'],
-                'vlan': cr_lrp_info['vlan']}
-        return mac_mappings
+        :param network_info: Network info dict
+        """
+        network_id = network_info['id']
+        vlan_id = network_info['vlan_id']
+        l2vni = network_info['l2vni']
+        l3vni = network_info['l3vni']
+
+        LOG.info("Cleaning up infrastructure for network %s", network_id)
+
+        try:
+            bridge_name = CONF.evpn_bridge
+
+            # Delete IRB device
+            if l3vni is not None:
+                irb_device = f'{bridge_name}.{vlan_id}'
+                LOG.debug("Deleting IRB device: %s", irb_device)
+                linux_net.delete_device(irb_device)
+
+                # Clean up static neighbors
+                if irb_device in self.static_neighbors:
+                    del self.static_neighbors[irb_device]
+
+            # Delete L2VNI
+            if l2vni:
+                vxlan_name = f'{constants.OVN_EVPN_VXLAN_PREFIX}{l2vni}'
+                LOG.debug("Deleting L2VNI device: %s", vxlan_name)
+                linux_net.delete_device(vxlan_name)
+
+            # Check if VRF is still in use
+            if l3vni is not None:
+                vrf_name = f'{constants.OVN_EVPN_VRF_PREFIX}{l3vni}'
+
+                if vrf_name in self.evpn_vrfs:
+                    # Remove this network from VRF's network list
+                    self.evpn_vrfs[vrf_name]['networks'].remove(network_id)
+
+                    # If VRF has no more networks, delete it
+                    if not self.evpn_vrfs[vrf_name]['networks']:
+                        LOG.info("Deleting VRF %s (no more networks)", vrf_name)
+
+                        # Delete from FRR
+                        evpn_info = {'vrf_name': vrf_name, 'vni': l3vni}
+                        frr.vrf_reconfigure(evpn_info, 'del-vrf')
+
+                        # Delete L3VNI VXLAN if exists
+                        if l3vni > 0:
+                            l3vni_name = f'{constants.OVN_EVPN_VXLAN_PREFIX}l3-{l3vni}'
+                            linux_net.delete_device(l3vni_name)
+
+                            irb_bridge = f'{constants.OVN_EVPN_BRIDGE_PREFIX}{l3vni}'
+                            linux_net.delete_device(irb_bridge)
+
+                        # Delete VRF device
+                        if CONF.delete_vrf_on_disconnect:
+                            linux_net.delete_device(vrf_name)
+
+                        del self.evpn_vrfs[vrf_name]
+
+            # Clean up FDB entries
+            if bridge_name in self.bridge_fdb_entries:
+                # Remove entries for this VLAN
+                self.bridge_fdb_entries[bridge_name] = [
+                    entry for entry in self.bridge_fdb_entries[bridge_name]
+                    if entry[1] != vlan_id
+                ]
+
+        except Exception as e:
+            LOG.warning("Failed to cleanup network infrastructure: %s", e)
+
+    def _parse_route_targets(self, ext_ids):
+        """Parse route targets from external_ids.
+
+        :param ext_ids: external_ids dict
+        :return: List of route targets
+        """
+        route_targets = []
+        rt_str = ext_ids.get(constants.OVN_EVPN_RT_EXT_ID_KEY)
+        if rt_str:
+            try:
+                route_targets = json.loads(rt_str)
+            except json.JSONDecodeError:
+                route_targets = [rt_str]
+        return route_targets
+
+    def _parse_route_distinguishers(self, ext_ids):
+        """Parse route distinguishers from external_ids.
+
+        :param ext_ids: external_ids dict
+        :return: List of route distinguishers
+        """
+        rds = []
+        rd_str = ext_ids.get(constants.OVN_EVPN_RD_EXT_ID_KEY)
+        if rd_str:
+            try:
+                rds = json.loads(rd_str)
+            except json.JSONDecodeError:
+                rds = [rd_str]
+        return rds
+
+    def _parse_import_targets(self, ext_ids):
+        """Parse import targets from external_ids.
+
+        :param ext_ids: external_ids dict
+        :return: List of import targets
+        """
+        import_targets = []
+        it_str = ext_ids.get(constants.OVN_EVPN_IRT_EXT_ID_KEY)
+        if it_str:
+            try:
+                import_targets = json.loads(it_str)
+            except json.JSONDecodeError:
+                import_targets = [it_str]
+        return import_targets
+
+    def _parse_export_targets(self, ext_ids):
+        """Parse export targets from external_ids.
+
+        :param ext_ids: external_ids dict
+        :return: List of export targets
+        """
+        export_targets = []
+        et_str = ext_ids.get(constants.OVN_EVPN_ERT_EXT_ID_KEY)
+        if et_str:
+            try:
+                export_targets = json.loads(et_str)
+            except json.JSONDecodeError:
+                export_targets = [et_str]
+        return export_targets
+
+    def _add_port_custom_routes(self, routes_str, network_info, port_ips):
+        """Add custom routes from port association.
+
+        Port associations can specify custom routes via bgpvpn-routes-control.
+
+        :param routes_str: JSON string with routes
+        :param network_info: Network info dict
+        :param port_ips: Port IP addresses
+        """
+        try:
+            routes = json.loads(routes_str)
+
+            if not network_info.get('l3vni'):
+                LOG.warning("Cannot add custom routes without L3VNI")
+                return
+
+            vrf_name = f'{constants.OVN_EVPN_VRF_PREFIX}{network_info["l3vni"]}'
+
+            if vrf_name not in self.evpn_vrfs:
+                LOG.warning("VRF %s not found for custom routes", vrf_name)
+                return
+
+            table_id = self.evpn_vrfs[vrf_name]['table_id']
+
+            for route in routes:
+                dst = route.get('destination')
+                nexthop = route.get('nexthop')
+
+                if dst and nexthop:
+                    LOG.info("Adding custom route: %s via %s (table %s)",
+                             dst, nexthop, table_id)
+
+                    # Add route to VRF table
+                    try:
+                        ip_version = 4 if ':' not in dst else 6
+                        linux_net.route_create({
+                            'dst': dst,
+                            'gateway': nexthop,
+                            'table': table_id,
+                            'family': constants.AF_INET if ip_version == 4
+                            else constants.AF_INET6,
+                        })
+                    except Exception as e:
+                        LOG.warning("Failed to add custom route %s: %s", dst, e)
+
+        except (json.JSONDecodeError, KeyError) as e:
+            LOG.warning("Failed to parse custom routes: %s", e)
+
+    def _get_network_mtu(self, datapath):
+        """Get MTU for network from OVN datapath.
+
+        :param datapath: OVN Datapath_Binding
+        :return: MTU value (int)
+        """
+        # Try to get MTU from datapath external_ids
+        try:
+            if hasattr(datapath, 'external_ids'):
+                mtu_str = datapath.external_ids.get('neutron:mtu')
+                if mtu_str:
+                    return int(mtu_str)
+        except (AttributeError, ValueError, KeyError) as e:
+            LOG.debug("Could not get MTU from datapath: %s", e)
+
+        # Fallback to configuration or default
+        if hasattr(CONF, 'network_device_mtu') and CONF.network_device_mtu:
+            return CONF.network_device_mtu
+
+        # Default MTU
+        return 1500
+
+    # =========================================================================
+    # FRR sync
+    # =========================================================================
+
+    @lockutils.synchronized('evpn')
+    def frr_sync(self):
+        """Ensure FRR EVPN configuration is synchronized.
+
+        Called periodically to ensure FRR config matches tracked state.
+        """
+        LOG.debug("Syncing FRR EVPN configuration")
+
+        try:
+            # Ensure base EVPN config
+            frr.ensure_evpn_base_config()
+
+            # Ensure all VRF configurations
+            for vrf_name, vrf_info in self.evpn_vrfs.items():
+                l3vni = vrf_info.get('l3vni')
+
+                # Get network info for this VRF to access full EVPN params
+                network_ids = vrf_info.get('networks', [])
+                if network_ids:
+                    # Use first network's info (all should have same VRF config)
+                    network_info = self.evpn_networks.get(network_ids[0])
+                    if network_info:
+                        # Build full EVPN info for FRR
+                        evpn_info = {
+                            'vrf_name': vrf_name,
+                            'vni': l3vni if l3vni and l3vni > 0 else 0,
+                            'bgp_as': network_info.get('bgp_as', CONF.bgp_AS),
+                            'route_targets': network_info.get('route_targets', []),
+                            'route_distinguishers': network_info.get('route_distinguishers', []),
+                            'import_targets': network_info.get('import_targets', []),
+                            'export_targets': network_info.get('export_targets', []),
+                            'local_ip': self._get_local_vtep_ip(),
+                        }
+
+                        # Add local preference if specified
+                        if network_info.get('local_pref'):
+                            evpn_info['local_pref'] = network_info['local_pref']
+
+                        # Reconfigure VRF in FRR
+                        frr.vrf_reconfigure(evpn_info, 'add-vrf')
+
+                        # Configure route leaking if needed
+                        if l3vni == 0:
+                            frr.vrf_leak(vrf_name, CONF.bgp_AS)
+
+        except Exception as e:
+            LOG.exception("FRR sync failed: %s", e)
