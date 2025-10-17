@@ -167,3 +167,37 @@ class MacAddressNotFound(OVNBGPAgentException):
 class IpAddressNotFound(OVNBGPAgentException):
     message = _("Addresses column has no IP addresses or is not set for port"
                 " %(lsp)s")
+
+
+# ============================================================================
+# EVPN-specific exceptions
+# ============================================================================
+
+class VlanIdExhausted(OVNBGPAgentException):
+    """VLAN ID pool exhausted.
+
+    Raised when no more VLAN IDs are available for allocation
+    in the EVPN VLAN manager.
+    """
+    message = _("No available VLAN IDs in the pool")
+
+
+class VlanIdConflict(OVNBGPAgentException):
+    """VLAN ID allocation conflict.
+
+    Raised when attempting to allocate a VLAN ID that is already in use.
+
+    :param vlan: The conflicting VLAN ID
+    :param vni: The VNI attempting to use this VLAN
+    """
+    message = _("VLAN %(vlan)s already in use for VNI %(vni)s")
+
+
+class NetworkNotFound(OVNBGPAgentException):
+    """Network not found.
+
+    Raised when a network cannot be found in the EVPN driver's state.
+
+    :param network: The network UUID
+    """
+    message = _("Network %(network)s not found in EVPN driver state")

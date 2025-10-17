@@ -847,6 +847,213 @@ def del_ip_route(ovn_routing_tables_routes, ip_address, route_table, dev,
         ovn_routing_tables_routes[dev].remove(route_info)
 
 
+# ============================================================================
+# Device state and attribute management
+# ============================================================================
+
+def set_device_state(device, state):
+    """Set network device state.
+
+    :param device: Device name
+    :param state: Device state ('up' or 'down')
+    """
+    ovn_bgp_agent.privileged.linux_net.set_device_state(device, state)
+
+
+def set_link_attribute(device, **kwargs):
+    """Set link attributes for a network device.
+
+    :param device: Device name
+    :param kwargs: Attributes to set (mtu, address, vlan_filtering, etc.)
+    """
+    ovn_bgp_agent.privileged.linux_net.set_link_attribute(device, **kwargs)
+
+
+def get_link_id(device):
+    """Get link ID (interface index) for a device.
+
+    Wrapper for getting network interface index.
+
+    :param device: Device name
+    :return: Interface index or None if not found
+
+    Example:
+        idx = get_link_id('eth0')
+        if idx:
+            print(f"Interface index: {idx}")
+    """
+    return ovn_bgp_agent.privileged.linux_net.get_link_id(device)
+
+
+# Backward compatibility alias
 def set_device_status(device, status, ndb=None):
-    ovn_bgp_agent.privileged.linux_net.set_device_state(
-        device, status, ndb=ndb)
+    """Set device state (backward compatibility wrapper).
+
+    Deprecated: Use set_device_state() instead.
+    """
+    set_device_state(device, status)
+
+
+# ============================================================================
+# IP address management
+# ============================================================================
+
+def add_ip_address(ip_address, device, prefixlen=None, **kwargs):
+    """Add IP address to a network device.
+
+    :param ip_address: IP address to add (can include CIDR notation)
+    :param device: Device name
+    :param prefixlen: Prefix length (optional)
+    :param kwargs: Additional parameters
+    """
+    ovn_bgp_agent.privileged.linux_net.add_ip_address(
+        ip_address, device, prefixlen, **kwargs)
+
+
+def delete_ip_address(ip_address, device, prefixlen=None, **kwargs):
+    """Delete IP address from a network device.
+
+    :param ip_address: IP address to delete
+    :param device: Device name
+    :param prefixlen: Prefix length (optional)
+    :param kwargs: Additional parameters
+    """
+    ovn_bgp_agent.privileged.linux_net.delete_ip_address(
+        ip_address, device, prefixlen, **kwargs)
+
+
+def get_ip_addresses(**kwargs):
+    """Get IP addresses from network interfaces.
+
+    Wrapper for querying IP addresses on network devices.
+
+    :param kwargs: Filter parameters (label, index, family, etc.)
+    :return: List of IP address information dictionaries
+
+    Example:
+        # Get all IPs on a specific interface
+        addrs = get_ip_addresses(label='eth0')
+
+        # Get IPv4 addresses only
+        addrs = get_ip_addresses(family=constants.AF_INET)
+
+        # Access address info
+        for addr in addrs:
+            addr_dict = dict(addr['attrs'])
+            ip = addr_dict['IFA_ADDRESS']
+            prefixlen = addr['prefixlen']
+    """
+    return ovn_bgp_agent.privileged.linux_net.get_ip_addresses(**kwargs)
+
+
+# ============================================================================
+# Route management
+# ============================================================================
+
+def route_create(route):
+    """Create or replace a route.
+
+    Wrapper for creating/replacing IP routes.
+
+    :param route: Route parameters dictionary
+
+    Example:
+        route = {
+            'dst': '10.0.0.0/24',
+            'gateway': '192.168.1.1',
+            'table': 100,
+            'family': constants.AF_INET,
+        }
+        route_create(route)
+    """
+    ovn_bgp_agent.privileged.linux_net.route_create(route)
+
+
+def route_delete(route):
+    """Delete a route.
+
+    Wrapper for deleting IP routes.
+
+    :param route: Route parameters dictionary
+    """
+    ovn_bgp_agent.privileged.linux_net.route_delete(route)
+
+
+# ============================================================================
+# EVPN-specific wrapper methods
+# ============================================================================
+
+def set_bridge_port_learning(device, learning):
+    """Set bridge port learning state.
+
+    :param device: Bridge port device name
+    :param learning: True to enable, False to disable
+    """
+    ovn_bgp_agent.privileged.linux_net.set_bridge_port_learning(
+        device, learning)
+
+
+def set_bridge_port_neigh_suppress(device, suppress):
+    """Set bridge port neighbor suppression.
+
+    :param device: Bridge port device name
+    :param suppress: True to enable, False to disable
+    """
+    ovn_bgp_agent.privileged.linux_net.set_bridge_port_neigh_suppress(
+        device, suppress)
+
+
+def add_bridge_fdb(mac, device, vlan=None, master=True, static=True):
+    """Add static FDB entry to bridge.
+
+    :param mac: MAC address
+    :param device: Bridge port device
+    :param vlan: VLAN ID (optional)
+    :param master: Add to bridge FDB
+    :param static: Make entry static
+    """
+    ovn_bgp_agent.privileged.linux_net.add_bridge_fdb(
+        mac, device, vlan, master, static)
+
+
+def del_bridge_fdb(mac, device, vlan=None, master=True):
+    """Delete FDB entry from bridge.
+
+    :param mac: MAC address
+    :param device: Bridge port device
+    :param vlan: VLAN ID (optional)
+    :param master: Remove from bridge FDB
+    """
+    ovn_bgp_agent.privileged.linux_net.del_bridge_fdb(
+        mac, device, vlan, master)
+
+
+def get_bridge_fdb(device):
+    """Get FDB entries for a bridge port.
+
+    :param device: Bridge port device name
+    :return: List of FDB entries
+    """
+    return ovn_bgp_agent.privileged.linux_net.get_bridge_fdb(device)
+
+
+def ensure_bridge_vlan(bridge, vlan, tagged=True, pvid=False, untagged=False):
+    """Ensure VLAN is present on bridge or bridge port.
+
+    :param bridge: Bridge or bridge port device name
+    :param vlan: VLAN ID
+    :param tagged: VLAN is tagged
+    :param pvid: Set as PVID
+    :param untagged: Set as untagged
+    """
+    ovn_bgp_agent.privileged.linux_net.ensure_bridge_vlan(
+        bridge, vlan, tagged, pvid, untagged)
+
+
+def del_bridge_vlan(bridge, vlan):
+    """Remove VLAN from bridge or bridge port.
+
+    :param bridge: Bridge or bridge port device name
+    :param vlan: VLAN ID
+    """
+    ovn_bgp_agent.privileged.linux_net.del_bridge_vlan(bridge, vlan)

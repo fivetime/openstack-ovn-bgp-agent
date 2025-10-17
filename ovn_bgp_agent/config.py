@@ -107,7 +107,9 @@ agent_opts = [
                default='br-evpn',
                help='Linux bridge name for attaching EVPN VNI devices. '
                     'All L2VNI and L3VNI VXLAN devices will be connected '
-                    'to this bridge. This bridge is separate from OVS.'),
+                    'to this bridge. This bridge is separate from OVS. '
+                    'VLAN filtering will be enabled on this bridge for '
+                    'multi-tenant isolation.'),
     cfg.StrOpt('evpn_bridge_veth',
                default='veth-to-ovs',
                help='Veth interface name on EVPN bridge side. '
@@ -124,24 +126,51 @@ agent_opts = [
                     'Formula: L2VNI = VLAN_ID + l2vni_offset. '
                     'Example: If VLAN is 100 and offset is 10000, L2VNI=10100. '
                     'Can be overridden by explicit VNI in OVN external_ids. '
-                    'Set to None to disable automatic calculation.'),
+                    'Set to None to disable automatic calculation. '
+                    'Note: For Symmetric IRB (type=l2), the same VNI is used '
+                    'for both L2 and L3, so this is rarely needed.'),
     cfg.BoolOpt('evpn_static_fdb',
                 default=True,
                 help='Pre-populate bridge FDB (Forwarding Database) with MAC '
                      'addresses from OVN Port_Binding. This optimization '
                      'reduces L2 flooding and helps trigger EVPN Type-2 '
-                     'MACIP route advertisement immediately.'),
+                     'MACIP route advertisement immediately. '
+                     'Only applies to type=l2 (Symmetric IRB mode).'),
     cfg.BoolOpt('evpn_static_neighbors',
                 default=True,
                 help='Pre-populate kernel neighbor table (ARP/NDP cache) with '
                      'IP-to-MAC mappings from OVN Port_Binding. This reduces '
                      'ARP/NDP queries and triggers EVPN Type-2 route '
-                     'advertisement for known hosts.'),
+                     'advertisement for known hosts immediately.'),
     cfg.StrOpt('ovs_bridge',
-               default='br-ex',
+               default='br-int',
                help='OVS bridge name to connect EVPN infrastructure to. '
-                    'Typically br-ex for provider network bridge or br-int '
-                    'for integration bridge.'),
+                    'For tenant networks, this should be br-int. '
+                    'For provider networks, this could be br-ex.'),
+    cfg.IntOpt('network_device_mtu',
+               default=1500,
+               min=68,
+               max=9000,
+               help='Default MTU for EVPN network devices (VXLAN, IRB, etc.). '
+                    'This is used when MTU cannot be determined from OVN. '
+                    'For VXLAN tunnels, should typically be 50 bytes less '
+                    'than physical network MTU to account for VXLAN overhead. '
+                    'Example: If physical MTU is 1500, set this to 1450.'),
+    cfg.IntOpt('evpn_vlan_range_min',
+               default=100,
+               min=2,
+               max=4094,
+               help='Minimum VLAN ID for EVPN bridge VLAN allocation. '
+                    'VLANs below this value are reserved for other uses. '
+                    'Default is 100 to avoid conflicts with common VLANs '
+                    '(VLAN 1 is default VLAN, VLAN 2-99 often reserved).'),
+    cfg.IntOpt('evpn_vlan_range_max',
+               default=4094,
+               min=2,
+               max=4094,
+               help='Maximum VLAN ID for EVPN bridge VLAN allocation. '
+                    'Default is 4094 (maximum 802.1Q VLAN ID). '
+                    'Must be greater than evpn_vlan_range_min.'),
 
     # =========================================================================
     # BGP/VRF Configuration Options
@@ -156,9 +185,9 @@ agent_opts = [
                      'from both kernel and FRR configuration when it is '
                      'no longer needed. If disabled, VRF device will be kept '
                      'even when redundant (only FRR config is removed). '
-                     'Note: For EVPN driver, this typically should be False '
-                     'to allow VRF reuse.',
-                default=True),
+                     'For EVPN driver, recommend setting to False to allow '
+                     'VRF reuse across network reconfigurations.',
+                default=False),  # Changed default for EVPN
     cfg.StrOpt('bgp_nic',
                default='bgp-nic',
                help='The name of the interface used within the VRF '
@@ -178,16 +207,12 @@ agent_opts = [
                      'with the same address scope on the provider and '
                      'internal interface are announced.'),
     cfg.StrOpt('exposing_method',
-               default='underlay',
+               default='vrf',
                choices=('underlay', 'l2vni', 'vrf', 'dynamic', 'ovn'),
                help='The exposing mechanism to be used. '
-                    '"underlay" (default): Expose on default/plain network. '
-                    '"l2vni": Extend L2 over L3 infrastructure via VNI (Type-2). '
-                    '"vrf": Expose routes in different VRFs/VNIs (Type-5). '
-                    '"dynamic": Mix of underlay, l2vni, and vrf based on '
-                    'port annotations. '
-                    '"ovn": Use dedicated per-node OVN cluster for traffic '
-                    'redirection instead of kernel networking.'),
+                    'For EVPN driver, use "vrf" or "dynamic". '
+                    '"vrf": Expose routes in VRFs with EVPN Type-5. '
+                    '"dynamic": Mix of methods based on port annotations.'),
 ]
 
 root_helper_opts = [

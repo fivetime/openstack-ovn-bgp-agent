@@ -83,6 +83,10 @@ OVN_EVPN_IMPORT_TARGETS_EXT_ID_KEY = 'neutron_bgpvpn:it'
 OVN_EVPN_EXPORT_TARGETS_EXT_ID_KEY = 'neutron_bgpvpn:et'
 OVN_EVPN_LOCAL_PREF_EXT_ID_KEY = 'neutron_bgpvpn:local_pref'
 
+# EVPN L2VNI and L3VNI separate configuration keys
+OVN_EVPN_L2VNI_EXT_ID_KEY = 'neutron_bgpvpn:l2vni'
+OVN_EVPN_L3VNI_EXT_ID_KEY = 'neutron_bgpvpn:l3vni'
+
 # Simplified aliases for compatibility
 OVN_EVPN_RT_EXT_ID_KEY = OVN_EVPN_ROUTE_TARGETS_EXT_ID_KEY
 OVN_EVPN_RD_EXT_ID_KEY = OVN_EVPN_ROUTE_DISTINGUISHERS_EXT_ID_KEY
