@@ -847,6 +847,7 @@ def _wire_lrp_port_underlay(routing_tables_routes, ip, bridge_device,
     ip_version = linux_net.get_ip_version(ip)
     for cr_lrp_ip in cr_lrp_ips:
         if linux_net.get_ip_version(cr_lrp_ip) == ip_version:
+            # Add route in the routing table for the bridge
             linux_net.add_ip_route(
                 routing_tables_routes,
                 ip.split("/")[0],
@@ -855,6 +856,26 @@ def _wire_lrp_port_underlay(routing_tables_routes, ip, bridge_device,
                 vlan=bridge_vlan,
                 mask=ip.split("/")[1],
                 via=cr_lrp_ip)
+
+            # For IPv6 GUA, add route in main routing table
+            if ip_version == constants.IP_VERSION_6:
+                LOG.debug("Adding IPv6 route in main table for network %s "
+                          "via %s", ip, cr_lrp_ip)
+                try:
+                    linux_net.add_ip_route(
+                        routing_tables_routes,
+                        ip.split("/")[0],
+                        254,  # main table
+                        bridge_device,
+                        vlan=bridge_vlan,
+                        mask=ip.split("/")[1],
+                        via=cr_lrp_ip)
+                    LOG.debug("Added IPv6 route in main table for network %s",
+                              ip)
+                except Exception as e:
+                    LOG.exception("Failed to add IPv6 route in main table "
+                                  "for network %s: %s", ip, e)
+                    return False
 
             if (CONF.advertisement_method_tenant_networks ==
                     constants.ADVERTISEMENT_METHOD_SUBNET):
@@ -923,6 +944,7 @@ def _unwire_lrp_port_underlay(routing_tables_routes, ip, bridge_device,
     ip_version = linux_net.get_ip_version(ip)
     for cr_lrp_ip in cr_lrp_ips:
         if linux_net.get_ip_version(cr_lrp_ip) == ip_version:
+            # Delete route from the routing table for the bridge
             linux_net.del_ip_route(
                 routing_tables_routes,
                 ip.split("/")[0],
@@ -931,6 +953,27 @@ def _unwire_lrp_port_underlay(routing_tables_routes, ip, bridge_device,
                 vlan=bridge_vlan,
                 mask=ip.split("/")[1],
                 via=cr_lrp_ip)
+
+            # For IPv6 GUA, delete route from main routing table
+            if ip_version == constants.IP_VERSION_6:
+                LOG.debug("Deleting IPv6 route from main table for network %s "
+                          "via %s", ip, cr_lrp_ip)
+                try:
+                    linux_net.del_ip_route(
+                        routing_tables_routes,
+                        ip.split("/")[0],
+                        254,  # main table
+                        bridge_device,
+                        vlan=bridge_vlan,
+                        mask=ip.split("/")[1],
+                        via=cr_lrp_ip)
+                    LOG.debug("Deleted IPv6 route from main table for "
+                              "network %s", ip)
+                except Exception as e:
+                    LOG.exception("Failed to delete IPv6 route from main "
+                                  "table for network %s: %s", ip, e)
+                    # Don't return False here as we still want to continue
+                    # with cleanup
 
             if (CONF.advertisement_method_tenant_networks ==
                     constants.ADVERTISEMENT_METHOD_SUBNET):
